@@ -409,10 +409,40 @@ document.getElementById('smart-modal-form').addEventListener('submit', (e) => {
             saleData.employeeGain = employeeGain;
         }
 
-        db.collection(salesCollection).add(saleData)
+        // Accredita sul saldo SOLO il guadagno azienda (yellowGain), non la spettanza dipendente
+        const yellowGain = saleData.yellowGain || 0;
+        const operatorName = localEmployees[empId]?.name || 'Dipendente';
+        const now = Date.now();
+        const batch = db.batch();
+        const saleRef = db.collection(salesCollection).doc();
+        batch.set(saleRef, saleData);
+
+        if (yellowGain > 0) {
+            const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
+            const newAmount = prev + yellowGain;
+            batch.set(db.collection('balance').doc('current'), {
+                amount: newAmount,
+                updatedAt: now,
+                updatedBy: operatorName
+            }, { merge: true });
+            const qtyLabel = qty > 1 ? ' x' + qty : '';
+            batch.set(db.collection('balance_logs').doc(), {
+                timestamp: now,
+                dateString: new Date(now).toLocaleString('it-IT'),
+                operatorName: operatorName,
+                employeeId: empId,
+                type: 'vendita',
+                prevAmount: prev,
+                newAmount: newAmount,
+                delta: yellowGain,
+                note: 'Vendita: ' + saleData.serviceName + qtyLabel
+            });
+        }
+
+        batch.commit()
             .then(() => {
                 closeSmartModal();
-                showToast("Vendita registrata!", "success");
+                showToast("Vendita registrata!" + (yellowGain > 0 ? " (+ " + formatValuta(yellowGain) + " in cassa)" : ""), "success");
             })
             .catch(err => showToast("Errore: " + err.message, "error"));
     }
@@ -1489,8 +1519,34 @@ window.deleteSaleItem = function(key, isYJ) {
     const sale = sales[key];
     if (!sale) return;
     showConfirmModal("Elimina Vendita", `Eliminare la vendita di "${sale.serviceName}" di ${sale.employeeName}?`, () => {
-        db.collection(collection).doc(key).delete()
-            .then(() => showToast("Vendita rimossa.", "info"))
+        const yellowGain = sale.yellowGain || 0;
+        const batch = db.batch();
+        batch.delete(db.collection(collection).doc(key));
+        // Storno dal saldo del solo guadagno azienda (se presente)
+        if (yellowGain > 0) {
+            const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
+            const newAmount = Math.max(0, prev - yellowGain);
+            const now = Date.now();
+            const operatorName = sale.employeeName || 'Sistema';
+            batch.set(db.collection('balance').doc('current'), {
+                amount: newAmount,
+                updatedAt: now,
+                updatedBy: operatorName
+            }, { merge: true });
+            batch.set(db.collection('balance_logs').doc(), {
+                timestamp: now,
+                dateString: new Date(now).toLocaleString('it-IT'),
+                operatorName: operatorName,
+                employeeId: sale.employeeKey || null,
+                type: 'storno',
+                prevAmount: prev,
+                newAmount: newAmount,
+                delta: -yellowGain,
+                note: 'Annullamento vendita: ' + (sale.serviceName || '—')
+            });
+        }
+        batch.commit()
+            .then(() => showToast("Vendita rimossa." + (yellowGain > 0 ? " Storno cassa: " + formatValuta(yellowGain) : ""), "info"))
             .catch(err => showToast(err.message, "error"));
     }, true);
 };
@@ -2329,6 +2385,10 @@ function renderSaldoUI() {
         let typeBadge;
         if (log.type === 'set') {
             typeBadge = '<span class="text-indigo-300 bg-indigo-500/15 px-2 py-0.5 rounded text-xs font-bold">Impostato</span>';
+        } else if (log.type === 'vendita') {
+            typeBadge = '<span class="text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded text-xs font-bold">💰 Vendita</span>';
+        } else if (log.type === 'storno') {
+            typeBadge = '<span class="text-red-400 bg-red-500/10 px-2 py-0.5 rounded text-xs font-bold">↩️ Storno</span>';
         } else if (log.type === 'deposita' || (log.type !== 'preleva' && isUp)) {
             typeBadge = '<span class="text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded text-xs font-bold">📥 Deposita</span>';
         } else {
