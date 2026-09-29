@@ -223,3 +223,15 @@ footer { border-top: 1px solid rgba(168, 85, 247, 0.2) !important; background: #
 }
 .inv-giacenza-scroll { max-height: min(65vh, 640px) !important; min-height: 320px !important; }
 .inv-logs-scroll { max-height: min(40vh, 380px) !important; min-height: 180px !important; }
+
+
+/* Card inventario: layout lineare */
+#inventory-yj-grid > div {
+    min-height: 0;
+}
+#inventory-yj-grid > div h4 {
+    line-height: 1.25;
+}
+#saldo-amount-display {
+    letter-spacing: -0.02em;
+}

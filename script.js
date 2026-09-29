@@ -33,6 +33,8 @@ let localInventoryFenLogs = [];
 let localStashes = {};
 let localArchive = {};
 let localItemImages = {};
+let localBalance = { amount: 0, updatedAt: null, updatedBy: null };
+let localBalanceLogs = [];
 
 // DOM
 const loginPage = document.getElementById('login-page');
@@ -43,12 +45,14 @@ const navSalesYjBtn = document.getElementById('nav-sales-yj-btn');
 const navSalesFenBtn = document.getElementById('nav-sales-fen-btn');
 const navInventoryYjBtn = document.getElementById('nav-inventory-yj-btn');
 const navInventoryFenBtn = document.getElementById('nav-inventory-fen-btn');
+const navSaldoBtn = document.getElementById('nav-saldo-btn');
 const navAdminBtn = document.getElementById('nav-admin-btn');
 
 const salesYjSection = document.getElementById('sales-yj-section');
 const salesFenSection = document.getElementById('sales-fen-section');
 const inventoryYjSection = document.getElementById('inventory-yj-section');
 const inventoryFenSection = document.getElementById('inventory-fen-section');
+const saldoSection = document.getElementById('saldo-section');
 const adminSection = document.getElementById('admin-section');
 
 const logoutBtn = document.getElementById('logout-btn');
@@ -63,8 +67,19 @@ if (imgNav) imgNav.onerror = function() { this.style.display = 'none'; };
 
 // --- UTILS ---
 function formatValuta(valore) {
-    if (isNaN(valore) || valore === null) valore = 0;
-    return "€ " + valore.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (valore === null || valore === undefined || isNaN(Number(valore))) valore = 0;
+    return "€ " + Number(valore).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/** Numeri interi / quantità con separatore migliaia italiano (es. 10.000) */
+function formatNumero(valore) {
+    if (valore === null || valore === undefined || isNaN(Number(valore))) valore = 0;
+    const n = Number(valore);
+    // Se ha decimali, mostra fino a 2; altrimenti intero con punti migliaia
+    if (Math.abs(n % 1) > 1e-9) {
+        return n.toLocaleString('it-IT', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+    }
+    return Math.round(n).toLocaleString('it-IT');
 }
 
 function getStartOfCurrentWeek() {
@@ -152,6 +167,23 @@ document.getElementById('modal-confirm-btn').addEventListener('click', () => {
     closeConfirmModal();
 });
 
+
+window.setSmartInvAction = function(action) {
+    const hidden = document.getElementById('smart-modal-action');
+    if (hidden) hidden.value = action;
+    const btnP = document.getElementById('smart-btn-preleva');
+    const btnD = document.getElementById('smart-btn-deposita');
+    if (btnP && btnD) {
+        if (action === 'preleva') {
+            btnP.className = 'py-3 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-2 border-amber-500 bg-amber-500/20 text-amber-400';
+            btnD.className = 'py-3 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-2 border-gray-600 bg-gray-900 text-gray-400 hover:border-emerald-500 hover:text-emerald-400';
+        } else {
+            btnD.className = 'py-3 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-2 border-emerald-500 bg-emerald-500/20 text-emerald-400';
+            btnP.className = 'py-3 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-2 border-gray-600 bg-gray-900 text-gray-400 hover:border-amber-500 hover:text-amber-400';
+        }
+    }
+};
+
 // --- SMART MODAL ---
 window.openSmartModal = function(type, itemId) {
     const modal = document.getElementById('smart-action-modal');
@@ -193,6 +225,7 @@ window.openSmartModal = function(type, itemId) {
         titleEl.innerHTML = `<i class="fa-solid fa-boxes-stacked mr-2"></i> Gestisci: <span class="text-white">${item.name}</span>`;
         document.getElementById('smart-modal-action-container').classList.remove('hidden');
         document.getElementById('smart-modal-reason-container').classList.remove('hidden');
+        if (typeof window.setSmartInvAction === 'function') window.setSmartInvAction('preleva');
         submitBtn.textContent = "Conferma Movimento";
         submitBtn.className = "w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold rounded-xl transition transform active:scale-95 shadow-lg mt-4";
     } else if (type === 'sale_catalog_yj' || type === 'sale_catalog_fen') {
@@ -234,7 +267,7 @@ function updateFreeSalePreview() {
         preview.classList.add('hidden');
         return;
     }
-    // % inserita = guadagno Yellow; stipendio = % personale dipendente
+    // % inserita = guadagno casa; stipendio = % personale dipendente
     const empId = document.getElementById('smart-modal-employee')?.value;
     let empPct = 40;
     if (empId && localEmployees[empId] && localEmployees[empId].customPercentage != null && localEmployees[empId].customPercentage !== '') {
@@ -601,9 +634,10 @@ function setupUIForRole() {
         else btn.classList.add('hidden');
     };
 
-    // Un solo flusso: Vendite + Inventario per tutti; Gestione solo gestore
+    // Vendite + Inventario + Saldo per tutti; Gestione solo gestore
     show(navSalesYjBtn, true);
     show(navInventoryYjBtn, true);
+    show(navSaldoBtn, true);
     show(navAdminBtn, isGestore);
     if (navSalesFenBtn) navSalesFenBtn.classList.add('hidden');
     if (navInventoryFenBtn) navInventoryFenBtn.classList.add('hidden');
@@ -624,6 +658,7 @@ navSalesYjBtn.addEventListener('click', () => showSection('sales-yj'));
 if (navSalesFenBtn) navSalesFenBtn.addEventListener('click', () => showSection('sales-fen'));
 navInventoryYjBtn.addEventListener('click', () => showSection('inventory-yj'));
 if (navInventoryFenBtn) navInventoryFenBtn.addEventListener('click', () => showSection('inventory-fen'));
+if (navSaldoBtn) navSaldoBtn.addEventListener('click', () => showSection('saldo'));
 navAdminBtn.addEventListener('click', () => showSection('admin'));
 
 let currentSectionId = 'sales-yj';
@@ -676,8 +711,12 @@ function refreshActiveSectionUI() {
             if (typeof renderInventoryFenDropdowns === 'function') renderInventoryFenDropdowns();
             if (typeof renderInventoryFenLogs === 'function') renderInventoryFenLogs();
             break;
+        case 'saldo':
+            if (typeof renderSaldoUI === 'function') renderSaldoUI();
+            break;
         case 'admin':
             if (typeof renderCatalogYJ === 'function') renderCatalogYJ();
+            if (typeof renderSaldoUI === 'function') renderSaldoUI();
             if (typeof renderCatalogFen === 'function') renderCatalogFen();
             if (typeof renderEmployees === 'function') renderEmployees();
             if (typeof renderCustomStashesList === 'function') renderCustomStashesList();
@@ -693,12 +732,12 @@ function refreshActiveSectionUI() {
 
 function showSection(section) {
     currentSectionId = section;
-    [salesYjSection, salesFenSection, inventoryYjSection, inventoryFenSection, adminSection].forEach(s => s && s.classList.add('hidden'));
+    [salesYjSection, salesFenSection, inventoryYjSection, inventoryFenSection, saldoSection, adminSection].forEach(s => s && s.classList.add('hidden'));
     
     const inactiveClass = "px-3 py-2 rounded-xl bg-gray-700 text-gray-200 font-medium transition hover:bg-gray-600 text-sm";
     const activeClass = "px-3 py-2 rounded-xl nav-active font-medium transition text-sm";
     
-    [navSalesYjBtn, navSalesFenBtn, navInventoryYjBtn, navInventoryFenBtn, navAdminBtn].forEach(b => {
+    [navSalesYjBtn, navSalesFenBtn, navInventoryYjBtn, navInventoryFenBtn, navSaldoBtn, navAdminBtn].forEach(b => {
         if (!b) return;
         const wasHidden = b.classList.contains('hidden');
         b.className = inactiveClass + (wasHidden ? ' hidden' : '');
@@ -708,14 +747,17 @@ function showSection(section) {
         salesYjSection.classList.remove('hidden');
         navSalesYjBtn.className = activeClass;
     } else if (section === 'sales-fen') {
-        salesFenSection.classList.remove('hidden');
-        navSalesFenBtn.className = activeClass;
+        if (salesFenSection) salesFenSection.classList.remove('hidden');
+        if (navSalesFenBtn) navSalesFenBtn.className = activeClass;
     } else if (section === 'inventory-yj') {
         inventoryYjSection.classList.remove('hidden');
         navInventoryYjBtn.className = activeClass;
     } else if (section === 'inventory-fen') {
-        inventoryFenSection.classList.remove('hidden');
-        navInventoryFenBtn.className = activeClass;
+        if (inventoryFenSection) inventoryFenSection.classList.remove('hidden');
+        if (navInventoryFenBtn) navInventoryFenBtn.className = activeClass;
+    } else if (section === 'saldo') {
+        if (saldoSection) saldoSection.classList.remove('hidden');
+        if (navSaldoBtn) navSaldoBtn.className = activeClass;
     } else if (section === 'admin') {
         adminSection.classList.remove('hidden');
         navAdminBtn.className = activeClass;
@@ -742,6 +784,26 @@ function initDatabaseListeners() {
             if (isAdminOpen() && typeof renderEmployees === 'function') renderEmployees();
         });
     });
+
+    
+    db.collection('balance').doc('current').onSnapshot(doc => {
+        if (doc.exists) {
+            localBalance = doc.data() || { amount: 0 };
+        } else {
+            localBalance = { amount: 0, updatedAt: null, updatedBy: null };
+        }
+        scheduleUI(function () {
+            if (typeof renderSaldoUI === 'function') renderSaldoUI();
+        });
+    }, err => console.warn('balance listener', err));
+
+    db.collection('balance_logs').orderBy('timestamp', 'desc').limit(80).onSnapshot(snapshot => {
+        localBalanceLogs = [];
+        snapshot.forEach(doc => localBalanceLogs.push({ id: doc.id, ...doc.data() }));
+        scheduleUI(function () {
+            if (typeof renderSaldoUI === 'function') renderSaldoUI();
+        });
+    }, err => console.warn('balance_logs listener', err));
 
     db.collection('catalog').onSnapshot(snapshot => {
         localCatalogYJ = {};
@@ -1169,6 +1231,7 @@ function renderAllEmployeeDropdowns() {
         const el = document.getElementById(id);
         if (el) el.innerHTML = opts;
     });
+    if (typeof fillSaldoMovEmployeeSelect === 'function') fillSaldoMovEmployeeSelect();
 }
 
 function renderAdminFilterDropdown() {
@@ -1399,7 +1462,7 @@ function renderSalesTableGeneric(tbodyId, salesObj, filterId, isYJ) {
             <tr class="hover:bg-gray-750/50 transition border-b border-gray-800">
                 <td class="py-3 text-xs text-gray-400">${(sale.dateString || '').split(',')[0]}</td>
                 <td class="py-3 font-semibold text-amber-400">${sale.employeeName}</td>
-                <td class="py-3 text-gray-300 text-xs">${sale.serviceName} <span class="text-[10px] text-gray-500">x${sale.quantity || 1}</span></td>
+                <td class="py-3 text-gray-300 text-xs">${sale.serviceName} <span class="text-[10px] text-gray-500">x${formatNumero(sale.quantity || 1)}</span></td>
                 <td class="py-3">${totaleCell}</td>
                 <td class="py-3 text-indigo-400 font-semibold">${spettCell}</td>
                 <td class="py-3 text-right">
@@ -1454,7 +1517,7 @@ function renderSalesArchiveWindowGeneric(containerId, filterId, activityFilter) 
             rows += `<tr class="border-b border-gray-800 text-xs">
                 <td class="py-1.5 px-2 text-gray-400">${(sale.dateString || '').split(',')[0]}</td>
                 <td class="py-1.5 px-2 text-amber-400">${sale.employeeName || '-'}</td>
-                <td class="py-1.5 px-2 text-gray-300">${sale.serviceName || '-'} x${sale.quantity || 1}</td>
+                <td class="py-1.5 px-2 text-gray-300">${sale.serviceName || '-'} x${formatNumero(sale.quantity || 1)}</td>
                 <td class="py-1.5 px-2 text-emerald-400 font-semibold">${formatValuta(sale.totalPrice)}</td>
                 <td class="py-1.5 px-2 text-indigo-400 font-semibold">${formatValuta(sale.employeeGain)} <span class="text-[9px] text-gray-500">(${sale.appliedPercentage || 40}%)</span></td>
             </tr>`;
@@ -1592,7 +1655,7 @@ function renderInventoryYjDropdowns() {
     sel.innerHTML = '<option value="">-- Seleziona Oggetto --</option>';
     Object.keys(localInventoryYJ).forEach(key => {
         const item = localInventoryYJ[key];
-        sel.innerHTML += `<option value="${key}">${item.name} (${getStashName(item.stash)}) - Disp: ${item.quantity}</option>`;
+        sel.innerHTML += `<option value="${key}">${item.name} (${getStashName(item.stash)}) - Disp: ${formatNumero(item.quantity)}</option>`;
     });
 }
 
@@ -1606,24 +1669,28 @@ function renderInventoryYjGrid() {
     if (stashVal !== 'all') items = items.filter(i => i.stash === stashVal);
     if (searchVal) items = items.filter(i => i.name.toLowerCase().includes(searchVal));
     if (items.length === 0) {
-        grid.innerHTML = `<div class="col-span-full text-center py-6 text-gray-500 text-sm">Nessun oggetto in inventario YJ.</div>`;
+        grid.innerHTML = `<div class="col-span-full text-center py-6 text-gray-500 text-sm">Nessun oggetto in inventario.</div>`;
         return;
     }
     items.forEach(item => {
+        const stashLabel = getStashName(item.stash);
+        const safeName = (item.name || '').replace(/'/g, "\\'");
+        const delBtn = (userRole === 'gestore')
+            ? `<button onclick="event.stopPropagation(); window.deleteInventoryItem('${item.id}', '${safeName}', true)" class="absolute top-2 right-2 p-1.5 bg-red-600/90 hover:bg-red-700 text-white rounded-lg text-xs z-20 opacity-0 group-hover:opacity-100 transition" title="Rimuovi"><i class="fa-solid fa-trash"></i></button>`
+            : '';
         grid.innerHTML += `
             <div onclick="openSmartModal('inv_yj', '${item.id}')" class="relative bg-gray-800 rounded-xl border border-gray-700 overflow-hidden shadow-lg flex flex-col group cursor-pointer hover:border-amber-500 transition-all">
-                <button onclick="event.stopPropagation(); window.deleteInventoryItem('${item.id}', '${item.name.replace(/'/g, "\\'")}', true)" class="absolute top-2 right-2 p-1.5 bg-red-600/90 hover:bg-red-700 text-white rounded-lg text-xs z-20" title="Rimuovi">
-                    <i class="fa-solid fa-trash"></i>
-                </button>
-                <div class="h-28 w-full bg-gray-900 flex items-center justify-center p-2">
-                    <img src="${item.imageUrl}" alt="${item.name}" class="max-h-full max-w-full object-contain drop-shadow-md group-hover:scale-110 transition" onerror="this.src='https://via.placeholder.com/150?text=No+Immagine';">
+                ${delBtn}
+                <div class="h-32 w-full bg-gray-900/80 flex items-center justify-center p-3">
+                    <img src="${item.imageUrl || 'https://via.placeholder.com/150?text=No+Immagine'}" alt="${item.name}" class="max-h-full max-w-full object-contain drop-shadow-md group-hover:scale-105 transition duration-200" onerror="this.src='https://via.placeholder.com/150?text=No+Immagine';">
                 </div>
-                <div class="p-3 flex-1 flex flex-col justify-between">
-                    <h4 class="font-bold text-amber-400 text-sm truncate">${item.name}</h4>
-                    <div class="mt-2 flex justify-between items-end">
-                        <span class="text-[10px] text-gray-400 font-semibold bg-gray-700 px-2 py-0.5 rounded">${getStashName(item.stash)}</span>
-                        <span class="text-emerald-400 font-bold text-sm">Qta: ${item.quantity}</span>
+                <div class="p-3 pt-2 flex flex-col gap-1.5 border-t border-gray-700/60">
+                    <h4 class="font-bold text-amber-400 text-sm leading-snug truncate" title="${item.name}">${item.name}</h4>
+                    <div class="flex items-baseline gap-1.5">
+                        <span class="text-[11px] text-gray-400 font-medium">Qta:</span>
+                        <span class="text-emerald-400 font-bold text-sm tabular-nums">${formatNumero(item.quantity)}</span>
                     </div>
+                    <span class="text-[10px] text-gray-500 font-semibold uppercase tracking-wide truncate">${stashLabel}</span>
                 </div>
             </div>
         `;
@@ -1648,7 +1715,7 @@ function renderInventoryYjLogs() {
                 <td class="p-3 text-xs text-gray-400">${log.dateString}</td>
                 <td class="p-3 font-semibold text-gray-200">${log.employeeName}</td>
                 <td class="p-3">${badge}</td>
-                <td class="p-3 text-gray-300 text-xs"><b>${log.itemName}</b> (x${log.quantity})</td>
+                <td class="p-3 text-gray-300 text-xs"><b>${log.itemName}</b> (x${formatNumero(log.quantity)})</td>
                 <td class="p-3 text-gray-400 text-xs italic truncate max-w-[150px]">${log.reason || '-'}</td>
             </tr>
         `;
@@ -1662,7 +1729,7 @@ document.getElementById('inventory-yj-admin-form')?.addEventListener('submit', (
     const quantity = parseInt(document.getElementById('inv-yj-admin-qty').value) || 0;
     const stash = document.getElementById('inv-yj-admin-stash').value;
     if (!name) { showToast("Inserisci il nome dell'oggetto.", "warning"); return; }
-    if (!stash) { showToast("Seleziona un deposito YJ.", "warning"); return; }
+    if (!stash) { showToast("Seleziona un deposito.", "warning"); return; }
     let imageUrl = 'https://via.placeholder.com/150?text=No+Immagine';
     let imageFileName = '';
     if (imgId && localItemImages[imgId]) {
@@ -1670,7 +1737,7 @@ document.getElementById('inventory-yj-admin-form')?.addEventListener('submit', (
         imageFileName = localItemImages[imgId].fileName || '';
     }
     db.collection('inventory_items').add({ name, imageUrl, imageFileName, quantity, stash, createdAt: Date.now() })
-        .then(() => { e.target.reset(); document.getElementById('inv-yj-admin-qty').value = 0; showToast("Oggetto creato solo in inventario YJ!", "success"); })
+        .then(() => { e.target.reset(); document.getElementById('inv-yj-admin-qty').value = 0; showToast("Oggetto creato in inventario!", "success"); })
         .catch(err => showToast("Errore salvataggio: " + err.message, "error"));
 });
 
@@ -1723,7 +1790,7 @@ function renderInventoryFenDropdowns() {
     sel.innerHTML = '<option value="">-- Seleziona Oggetto --</option>';
     Object.keys(localInventoryFen).forEach(key => {
         const item = localInventoryFen[key];
-        sel.innerHTML += `<option value="${key}">${item.name} (${getStashName(item.stash)}) - Disp: ${item.quantity}</option>`;
+        sel.innerHTML += `<option value="${key}">${item.name} (${getStashName(item.stash)}) - Disp: ${formatNumero(item.quantity)}</option>`;
     });
 }
 
@@ -1753,7 +1820,7 @@ function renderInventoryFenGrid() {
                     <h4 class="font-bold text-amber-400 text-sm truncate">${item.name}</h4>
                     <div class="mt-2 flex justify-between items-end">
                         <span class="text-[10px] text-gray-400 font-semibold bg-gray-700 px-2 py-0.5 rounded">${getStashName(item.stash)}</span>
-                        <span class="text-emerald-400 font-bold text-sm">Qta: ${item.quantity}</span>
+                        <span class="text-emerald-400 font-bold text-sm">Qta: ${formatNumero(item.quantity)}</span>
                     </div>
                 </div>
             </div>
@@ -1779,7 +1846,7 @@ function renderInventoryFenLogs() {
                 <td class="p-3 text-xs text-gray-400">${log.dateString}</td>
                 <td class="p-3 font-semibold text-gray-200">${log.employeeName}</td>
                 <td class="p-3">${badge}</td>
-                <td class="p-3 text-gray-300 text-xs"><b>${log.itemName}</b> (x${log.quantity})</td>
+                <td class="p-3 text-gray-300 text-xs"><b>${log.itemName}</b> (x${formatNumero(log.quantity)})</td>
                 <td class="p-3 text-gray-400 text-xs italic truncate max-w-[150px]">${log.reason || '-'}</td>
             </tr>
         `;
@@ -1831,7 +1898,7 @@ document.getElementById('inventory-fen-transaction-form')?.addEventListener('sub
     batch.commit().then(() => {
         e.target.reset();
         document.getElementById('inv-fen-qty').value = 1;
-        showToast("Movimento Fenici registrato!", "success");
+        showToast("Movimento registrato!", "success");
     }).catch(err => showToast(err.message, "error"));
 });
 
@@ -2023,7 +2090,7 @@ function calculateManagementData() {
                         <td class="py-2 text-gray-400">${sale.dateString}</td>
                         <td class="py-2 text-xs text-gray-500">${activityLabel}</td>
                         <td class="py-2 font-bold text-amber-400">${sale.serviceName}</td>
-                        <td class="py-2 text-center text-gray-300">${sale.quantity || 1}</td>
+                        <td class="py-2 text-center text-gray-300">${formatNumero(sale.quantity || 1)}</td>
                         <td class="py-2 text-emerald-400 font-semibold">${formatValuta(sale.totalPrice)}</td>
                         <td class="py-2 text-indigo-400 font-bold">${formatValuta(sale.employeeGain)}</td>
                     </tr>
@@ -2066,7 +2133,7 @@ function calculateManagementData() {
         tbody.innerHTML += `
             <tr class="border-b border-gray-700/80 hover:bg-gray-750/50 transition text-xs ${highlight}">
                 <td class="p-3 font-semibold text-gray-200">${s.name}</td>
-                <td class="p-3 text-gray-400">${s.count} oggetti</td>
+                <td class="p-3 text-gray-400">${formatNumero(s.count)} oggetti</td>
                 <td class="p-3 text-amber-500 font-bold">${s.pct}%</td>
                 <td class="p-3 font-bold text-emerald-400 text-sm">${formatValuta(s.salary)}</td>
                 <td class="p-3 text-right">
@@ -2228,3 +2295,205 @@ function renderArchive(archiveList) {
         `;
     });
 }
+
+
+// --- SALDO CASSA ---
+function renderSaldoUI() {
+    if (typeof fillSaldoMovEmployeeSelect === 'function') fillSaldoMovEmployeeSelect();
+    const amountEl = document.getElementById('saldo-amount-display');
+    const updatedEl = document.getElementById('saldo-updated-at');
+    const adminCurrent = document.getElementById('balance-admin-current');
+    const amt = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
+    if (amountEl) amountEl.textContent = formatValuta(amt);
+    if (adminCurrent) adminCurrent.textContent = formatValuta(amt);
+    if (updatedEl) {
+        if (localBalance && localBalance.updatedAt) {
+            const d = new Date(localBalance.updatedAt);
+            const by = localBalance.updatedBy || '—';
+            updatedEl.textContent = 'Aggiornato il ' + d.toLocaleString('it-IT') + ' · da ' + by;
+        } else {
+            updatedEl.textContent = 'Nessun aggiornamento registrato';
+        }
+    }
+    const tbody = document.getElementById('saldo-logs-table');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+    if (!localBalanceLogs || localBalanceLogs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-gray-500 text-xs">Nessun movimento saldo.</td></tr>';
+        return;
+    }
+    localBalanceLogs.forEach(log => {
+        const delta = log.delta != null ? log.delta : (log.newAmount - (log.prevAmount || 0));
+        const isUp = delta >= 0;
+        const deltaStr = (isUp ? '+' : '') + formatValuta(delta);
+        let typeBadge;
+        if (log.type === 'set') {
+            typeBadge = '<span class="text-indigo-300 bg-indigo-500/15 px-2 py-0.5 rounded text-xs font-bold">Impostato</span>';
+        } else if (log.type === 'deposita' || (log.type !== 'preleva' && isUp)) {
+            typeBadge = '<span class="text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded text-xs font-bold">📥 Deposita</span>';
+        } else {
+            typeBadge = '<span class="text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded text-xs font-bold">📤 Preleva</span>';
+        }
+        tbody.innerHTML += `
+            <tr class="hover:bg-gray-750/50 border-b border-gray-700">
+                <td class="p-3 text-xs text-gray-400 whitespace-nowrap">${log.dateString || '—'}</td>
+                <td class="p-3 font-semibold text-gray-200 text-xs">${log.operatorName || '—'}</td>
+                <td class="p-3">${typeBadge}</td>
+                <td class="p-3 font-bold text-sm ${isUp ? 'text-emerald-400' : 'text-amber-400'}">${deltaStr}</td>
+                <td class="p-3 text-gray-200 font-semibold text-sm">${formatValuta(log.newAmount)}</td>
+                <td class="p-3 text-gray-400 text-xs italic truncate max-w-[180px]">${log.note || '—'}</td>
+            </tr>
+        `;
+    });
+}
+
+document.getElementById('balance-admin-form')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (userRole !== 'gestore') {
+        showToast('Solo il gestore può modificare il saldo.', 'error');
+        return;
+    }
+    const val = parseFloat(document.getElementById('balance-admin-value').value);
+    const note = (document.getElementById('balance-admin-note')?.value || '').trim();
+    if (isNaN(val) || val < 0) {
+        showToast('Inserisci un importo valido (≥ 0).', 'warning');
+        return;
+    }
+    const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
+    const operatorName = currentUser?.email || 'Gestore';
+    const now = Date.now();
+    const batch = db.batch();
+    const balRef = db.collection('balance').doc('current');
+    batch.set(balRef, {
+        amount: val,
+        updatedAt: now,
+        updatedBy: operatorName
+    }, { merge: true });
+    const logRef = db.collection('balance_logs').doc();
+    batch.set(logRef, {
+        timestamp: now,
+        dateString: new Date(now).toLocaleString('it-IT'),
+        operatorName,
+        type: 'set',
+        prevAmount: prev,
+        newAmount: val,
+        delta: val - prev,
+        note: note || 'Aggiornamento manuale saldo'
+    });
+    batch.commit()
+        .then(() => {
+            document.getElementById('balance-admin-value').value = '';
+            document.getElementById('balance-admin-note').value = '';
+            showToast('Saldo aggiornato!', 'success');
+        })
+        .catch(err => showToast('Errore: ' + err.message, 'error'));
+});
+
+
+window.setSaldoMovAction = function(action) {
+    const hidden = document.getElementById('saldo-mov-action');
+    if (hidden) hidden.value = action;
+    const btnP = document.getElementById('saldo-btn-preleva');
+    const btnD = document.getElementById('saldo-btn-deposita');
+    if (btnP && btnD) {
+        if (action === 'preleva') {
+            btnP.className = 'py-2.5 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-1.5 border-amber-500 bg-amber-500/20 text-amber-400';
+            btnD.className = 'py-2.5 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-1.5 border-gray-600 bg-gray-900 text-gray-400 hover:border-emerald-500 hover:text-emerald-400';
+        } else {
+            btnD.className = 'py-2.5 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-1.5 border-emerald-500 bg-emerald-500/20 text-emerald-400';
+            btnP.className = 'py-2.5 rounded-xl font-bold text-sm border-2 transition flex items-center justify-center gap-1.5 border-gray-600 bg-gray-900 text-gray-400 hover:border-amber-500 hover:text-amber-400';
+        }
+    }
+};
+
+function fillSaldoMovEmployeeSelect() {
+    const sel = document.getElementById('saldo-mov-employee');
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">-- Seleziona --</option>';
+    Object.keys(localEmployees).forEach(key => {
+        sel.innerHTML += `<option value="${key}">${localEmployees[key].name}</option>`;
+    });
+    if (userRole === 'gestore') {
+        sel.innerHTML += '<option value="__gestore__">Gestore</option>';
+    }
+    if (userRole === 'dipendente' && currentEmployeeId) {
+        sel.value = currentEmployeeId;
+        sel.disabled = true;
+    } else {
+        sel.disabled = false;
+        if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+        else if (userRole === 'gestore') sel.value = '__gestore__';
+    }
+}
+
+document.getElementById('saldo-movimento-form')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const empVal = document.getElementById('saldo-mov-employee')?.value;
+    const action = document.getElementById('saldo-mov-action')?.value || 'preleva';
+    const amount = parseFloat(document.getElementById('saldo-mov-amount')?.value);
+    const note = (document.getElementById('saldo-mov-note')?.value || '').trim();
+
+    if (!empVal) {
+        showToast('Seleziona l\'operatore.', 'warning');
+        return;
+    }
+    if (isNaN(amount) || amount <= 0) {
+        showToast('Inserisci un importo valido maggiore di zero.', 'warning');
+        return;
+    }
+
+    let operatorName = 'Operatore';
+    if (empVal === '__gestore__') {
+        operatorName = currentUser?.email || 'Gestore';
+    } else if (localEmployees[empVal]) {
+        operatorName = localEmployees[empVal].name;
+    }
+
+    const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
+    let newAmount = prev;
+    let delta = 0;
+    if (action === 'preleva') {
+        if (amount > prev) {
+            showToast('Importo superiore al saldo disponibile (' + formatValuta(prev) + ').', 'error');
+            return;
+        }
+        newAmount = prev - amount;
+        delta = -amount;
+    } else {
+        newAmount = prev + amount;
+        delta = amount;
+    }
+
+    const now = Date.now();
+    const batch = db.batch();
+    batch.set(db.collection('balance').doc('current'), {
+        amount: newAmount,
+        updatedAt: now,
+        updatedBy: operatorName
+    }, { merge: true });
+    batch.set(db.collection('balance_logs').doc(), {
+        timestamp: now,
+        dateString: new Date(now).toLocaleString('it-IT'),
+        operatorName,
+        employeeId: empVal === '__gestore__' ? null : empVal,
+        type: action === 'preleva' ? 'preleva' : 'deposita',
+        prevAmount: prev,
+        newAmount: newAmount,
+        delta: delta,
+        note: note || (action === 'preleva' ? 'Prelievo crediti' : 'Deposito crediti')
+    });
+    batch.commit()
+        .then(() => {
+            document.getElementById('saldo-mov-amount').value = '';
+            document.getElementById('saldo-mov-note').value = '';
+            if (typeof window.setSaldoMovAction === 'function') window.setSaldoMovAction('preleva');
+            showToast(action === 'preleva' ? 'Prelievo registrato!' : 'Deposito registrato!', 'success');
+        })
+        .catch(err => {
+            const msg = (err && String(err.message || err.code || '').includes('permission'))
+                ? 'Permesso negato su balance/balance_logs. Aggiorna le regole Firestore.'
+                : ('Errore: ' + (err.message || err));
+            showToast(msg, 'error');
+        });
+});
