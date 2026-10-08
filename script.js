@@ -163,8 +163,23 @@ function closeConfirmModal() {
 
 document.getElementById('modal-cancel-btn').addEventListener('click', closeConfirmModal);
 document.getElementById('modal-confirm-btn').addEventListener('click', () => {
-    if (modalCallback) modalCallback();
+    const cb = modalCallback;
+    modalCallback = null;
     closeConfirmModal();
+    if (typeof cb === 'function') {
+        try {
+            const result = cb();
+            if (result && typeof result.then === 'function') {
+                result.catch(function (err) {
+                    console.error('confirm action error', err);
+                    showToast('Errore: ' + (err && err.message ? err.message : err), 'error');
+                });
+            }
+        } catch (err) {
+            console.error('confirm action error', err);
+            showToast('Errore: ' + (err && err.message ? err.message : err), 'error');
+        }
+    }
 });
 
 
@@ -1354,149 +1369,214 @@ window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
  * Riduce drasticamente il peso dei dataUrl in Firestore e il lag del browser.
  */
 window.optimizeExistingItemImages = async function optimizeExistingItemImages() {
-    if (userRole !== 'gestore') {
-        showToast('Solo il gestore può ottimizzare le immagini.', 'error');
-        return;
-    }
-    var ids = Object.keys(localItemImages);
-    if (ids.length === 0) {
-        showToast('Nessuna immagine in libreria.', 'warning');
-        return;
-    }
-    showConfirmModal(
-        'Ottimizza immagini esistenti',
-        'Comprimerò fino a ' + ids.length + ' immagini (max ' + ITEM_IMAGE_MAX_SIDE + 'px, JPEG) e aggiornerò gli oggetti in inventario che le usano. Può richiedere 1–2 minuti. Continuare?',
-        async function () {
-            var statusEl = document.getElementById('item-image-status');
-            var btn = document.getElementById('item-image-optimize-btn');
-            var prevHtml = btn ? btn.innerHTML : '';
-            if (btn) {
-                btn.disabled = true;
-                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Ottimizzo...';
-            }
-            if (statusEl) {
-                statusEl.classList.remove('hidden');
-                statusEl.textContent = 'Ottimizzazione in corso...';
-            }
-            var done = 0, skipped = 0, failed = 0, bytesSaved = 0;
-            var mapOldToNew = {}; // old dataUrl -> new dataUrl (solo se cambiato)
+    var statusEl = document.getElementById('item-image-status');
+    var btn = document.getElementById('item-image-optimize-btn');
+    try {
+        if (statusEl) {
+            statusEl.classList.remove('hidden');
+            statusEl.textContent = 'Preparazione ottimizzazione...';
+        }
+        showToast('Avvio ottimizzazione immagini...', 'info');
 
-            for (var i = 0; i < ids.length; i++) {
-                var id = ids[i];
-                var rec = localItemImages[id];
-                if (!rec || !rec.dataUrl) { skipped++; continue; }
-                if (statusEl) statusEl.textContent = 'Ottimizzo ' + (i + 1) + '/' + ids.length + ': ' + (rec.fileName || id);
-                if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> ' + (i + 1) + '/' + ids.length;
+        if (userRole !== 'gestore') {
+            showToast('Solo il gestore può ottimizzare le immagini. Accedi come Gestore.', 'error');
+            if (statusEl) statusEl.textContent = 'Errore: non sei loggato come gestore.';
+            return;
+        }
+        if (!auth.currentUser) {
+            showToast('Sessione gestore non attiva. Rieffettua il login gestore.', 'error');
+            if (statusEl) statusEl.textContent = 'Errore: auth gestore assente (serve Firebase Auth).';
+            return;
+        }
 
-                var oldSize = rec.size || estimateDataUrlBytes(rec.dataUrl);
-                if (rec.optimized && oldSize > 0 && oldSize < ITEM_IMAGE_SKIP_IF_UNDER) {
-                    skipped++;
-                    continue;
-                }
-                try {
-                    var out = await compressImageSource(rec.dataUrl, ITEM_IMAGE_MAX_SIDE, ITEM_IMAGE_JPEG_QUALITY);
-                    if (out.sizeApprox >= oldSize * 0.95 && oldSize < MAX_ITEM_IMAGE_BYTES) {
-                        // guadagno minimo: marca comunque optimized se già piccola
-                        if (!rec.optimized) {
-                            await db.collection('item_images').doc(id).set({ optimized: true, size: oldSize }, { merge: true });
-                        }
-                        skipped++;
-                        continue;
-                    }
-                    var newFileName = (rec.fileName || 'img').replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.jpg';
-                    await db.collection('item_images').doc(id).set({
-                        fileName: newFileName,
-                        dataUrl: out.dataUrl,
-                        size: out.sizeApprox,
-                        width: out.width,
-                        height: out.height,
-                        optimized: true,
-                        optimizedAt: Date.now()
-                    }, { merge: true });
-                    mapOldToNew[rec.dataUrl] = out.dataUrl;
-                    mapOldToNew['fn:' + (rec.fileName || '').toLowerCase()] = out.dataUrl;
-                    mapOldToNew['fn:' + newFileName.toLowerCase()] = out.dataUrl;
-                    bytesSaved += Math.max(0, oldSize - out.sizeApprox);
-                    done++;
-                } catch (err) {
-                    console.error('optimize image', id, err);
-                    failed++;
-                }
-                // yield al browser per non bloccare UI
-                await new Promise(function (r) { setTimeout(r, 30); });
-            }
-
-            // Aggiorna inventory_items (e fenici se presenti) che puntano alle vecchie dataUrl / fileName
-            function resolveNewUrl(d) {
-                if (d.imageUrl && mapOldToNew[d.imageUrl]) return mapOldToNew[d.imageUrl];
-                if (d.imageFileName) {
-                    var fn = String(d.imageFileName).toLowerCase();
-                    if (mapOldToNew['fn:' + fn]) return mapOldToNew['fn:' + fn];
-                    var base = fn.replace(/\.(png|jpe?g|webp|gif)$/i, '');
-                    if (mapOldToNew['fn:' + base + '.jpg']) return mapOldToNew['fn:' + base + '.jpg'];
-                    if (mapOldToNew['fn:' + base + '.png']) return mapOldToNew['fn:' + base + '.png'];
-                }
-                return null;
-            }
-            async function commitInChunks(updates) {
-                for (var i = 0; i < updates.length; i += 400) {
-                    var slice = updates.slice(i, i + 400);
-                    var b = db.batch();
-                    slice.forEach(function (u) { b.update(u.ref, u.patch); });
-                    await b.commit();
-                }
-            }
-            var invUpdated = 0;
+        var imagesMap = {};
+        var ids = Object.keys(localItemImages || {});
+        if (ids.length === 0) {
+            if (statusEl) statusEl.textContent = 'Carico libreria da Firestore...';
             try {
-                var invSnap = await db.collection('inventory_items').get();
-                var updates = [];
-                invSnap.forEach(function (doc) {
-                    var d = doc.data() || {};
-                    var newUrl = resolveNewUrl(d);
-                    if (newUrl) {
-                        var patch = { imageUrl: newUrl };
+                var snap = await db.collection('item_images').get();
+                snap.forEach(function (doc) { imagesMap[doc.id] = doc.data(); });
+                ids = Object.keys(imagesMap);
+            } catch (errLoad) {
+                console.error(errLoad);
+                var m = (errLoad && errLoad.message) ? errLoad.message : String(errLoad);
+                showToast('Impossibile leggere item_images: ' + m, 'error');
+                if (statusEl) statusEl.textContent = 'Errore lettura: ' + m;
+                return;
+            }
+        } else {
+            ids.forEach(function (id) { imagesMap[id] = localItemImages[id]; });
+        }
+
+        if (ids.length === 0) {
+            showToast('Nessuna immagine in libreria da ottimizzare.', 'warning');
+            if (statusEl) statusEl.textContent = 'Libreria vuota: carica prima delle immagini.';
+            return;
+        }
+
+        showConfirmModal(
+            'Ottimizza immagini esistenti',
+            'Comprimerò fino a ' + ids.length + ' immagini (max ' + ITEM_IMAGE_MAX_SIDE + 'px, JPEG) e aggiornerò gli oggetti in inventario collegati. Può richiedere 1–2 minuti. Continuare?',
+            function () {
+                (async function runOptimize() {
+                    var prevHtml = btn ? btn.innerHTML : '';
+                    if (btn) {
+                        btn.disabled = true;
+                        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Ottimizzo...';
+                    }
+                    if (statusEl) {
+                        statusEl.classList.remove('hidden');
+                        statusEl.textContent = 'Ottimizzazione in corso (0/' + ids.length + ')...';
+                    }
+                    var done = 0, skipped = 0, failed = 0, bytesSaved = 0;
+                    var mapOldToNew = {};
+                    var firstPermError = null;
+
+                    for (var i = 0; i < ids.length; i++) {
+                        var id = ids[i];
+                        var rec = imagesMap[id];
+                        if (!rec || !rec.dataUrl) { skipped++; continue; }
+                        if (statusEl) statusEl.textContent = 'Ottimizzo ' + (i + 1) + '/' + ids.length + ': ' + (rec.fileName || id);
+                        if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> ' + (i + 1) + '/' + ids.length;
+
+                        var oldSize = rec.size || estimateDataUrlBytes(rec.dataUrl);
+                        if (rec.optimized && oldSize > 0 && oldSize < ITEM_IMAGE_SKIP_IF_UNDER) {
+                            skipped++;
+                            continue;
+                        }
+                        try {
+                            var out = await compressImageSource(rec.dataUrl, ITEM_IMAGE_MAX_SIDE, ITEM_IMAGE_JPEG_QUALITY);
+                            if (out.sizeApprox >= oldSize * 0.95 && oldSize < MAX_ITEM_IMAGE_BYTES) {
+                                if (!rec.optimized) {
+                                    await db.collection('item_images').doc(id).set({ optimized: true, size: oldSize }, { merge: true });
+                                }
+                                skipped++;
+                                continue;
+                            }
+                            var newFileName = (rec.fileName || 'img').replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.jpg';
+                            await db.collection('item_images').doc(id).set({
+                                fileName: newFileName,
+                                dataUrl: out.dataUrl,
+                                size: out.sizeApprox,
+                                width: out.width,
+                                height: out.height,
+                                optimized: true,
+                                optimizedAt: Date.now()
+                            }, { merge: true });
+                            mapOldToNew[rec.dataUrl] = out.dataUrl;
+                            mapOldToNew['fn:' + (rec.fileName || '').toLowerCase()] = out.dataUrl;
+                            mapOldToNew['fn:' + newFileName.toLowerCase()] = out.dataUrl;
+                            bytesSaved += Math.max(0, oldSize - out.sizeApprox);
+                            done++;
+                        } catch (err) {
+                            console.error('optimize image', id, err);
+                            failed++;
+                            var em = (err && (err.code || err.message)) ? String(err.code || err.message) : String(err);
+                            if (!firstPermError && (em.indexOf('permission') !== -1 || em.indexOf('Permission') !== -1)) {
+                                firstPermError = em;
+                            }
+                        }
+                        await new Promise(function (r) { setTimeout(r, 20); });
+                    }
+
+                    function resolveNewUrl(d) {
+                        if (d.imageUrl && mapOldToNew[d.imageUrl]) return mapOldToNew[d.imageUrl];
                         if (d.imageFileName) {
-                            patch.imageFileName = String(d.imageFileName).replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.jpg';
+                            var fn = String(d.imageFileName).toLowerCase();
+                            if (mapOldToNew['fn:' + fn]) return mapOldToNew['fn:' + fn];
+                            var base = fn.replace(/\.(png|jpe?g|webp|gif)$/i, '');
+                            if (mapOldToNew['fn:' + base + '.jpg']) return mapOldToNew['fn:' + base + '.jpg'];
+                            if (mapOldToNew['fn:' + base + '.png']) return mapOldToNew['fn:' + base + '.png'];
                         }
-                        updates.push({ ref: doc.ref, patch: patch });
-                        invUpdated++;
+                        return null;
                     }
-                });
-                if (updates.length) await commitInChunks(updates);
-            } catch (errInv) {
-                console.warn('update inventory after optimize', errInv);
-            }
-
-            // fenici_items opzionale
-            try {
-                var fenSnap = await db.collection('fenici_items').get();
-                var updates2 = [];
-                fenSnap.forEach(function (doc) {
-                    var d = doc.data() || {};
-                    var newUrl = resolveNewUrl(d);
-                    if (newUrl) {
-                        updates2.push({ ref: doc.ref, patch: { imageUrl: newUrl } });
-                        invUpdated++;
+                    async function commitInChunks(updates) {
+                        for (var j = 0; j < updates.length; j += 400) {
+                            var slice = updates.slice(j, j + 400);
+                            var b = db.batch();
+                            slice.forEach(function (u) { b.update(u.ref, u.patch); });
+                            await b.commit();
+                        }
                     }
-                });
-                if (updates2.length) await commitInChunks(updates2);
-            } catch (_) { /* collezione forse assente */ }
+                    var invUpdated = 0;
+                    try {
+                        var invSnap = await db.collection('inventory_items').get();
+                        var updates = [];
+                        invSnap.forEach(function (doc) {
+                            var d = doc.data() || {};
+                            var newUrl = resolveNewUrl(d);
+                            if (newUrl) {
+                                var patch = { imageUrl: newUrl };
+                                if (d.imageFileName) {
+                                    patch.imageFileName = String(d.imageFileName).replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.jpg';
+                                }
+                                updates.push({ ref: doc.ref, patch: patch });
+                                invUpdated++;
+                            }
+                        });
+                        if (updates.length) await commitInChunks(updates);
+                    } catch (errInv) {
+                        console.warn('update inventory after optimize', errInv);
+                    }
+                    try {
+                        var fenSnap = await db.collection('fenici_items').get();
+                        var updates2 = [];
+                        fenSnap.forEach(function (doc) {
+                            var d = doc.data() || {};
+                            var newUrl = resolveNewUrl(d);
+                            if (newUrl) {
+                                updates2.push({ ref: doc.ref, patch: { imageUrl: newUrl } });
+                                invUpdated++;
+                            }
+                        });
+                        if (updates2.length) await commitInChunks(updates2);
+                    } catch (_) {}
 
-            if (btn) {
-                btn.disabled = false;
-                btn.innerHTML = prevHtml || '<i class="fa-solid fa-compress mr-1"></i> Ottimizza immagini esistenti';
-            }
-            if (statusEl) {
-                statusEl.textContent = 'Fatto: ' + done + ' ottimizzate, ' + skipped + ' già ok, ' + failed + ' errori. Item aggiornati: ' + invUpdated + '. Risparmiati ~' + Math.round(bytesSaved / 1024) + ' KB.';
-            }
-            showToast(
-                'Ottimizzazione completata: ' + done + ' immagini · ~' + Math.round(bytesSaved / 1024) + ' KB risparmiati · ' + invUpdated + ' item aggiornati',
-                failed ? 'warning' : 'success'
-            );
-        },
-        false
-    );
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.innerHTML = prevHtml || '<i class="fa-solid fa-compress mr-1"></i> Ottimizza immagini esistenti + aggiorna item';
+                    }
+                    var summary = 'Fatto: ' + done + ' ottimizzate, ' + skipped + ' già ok, ' + failed + ' errori. Item aggiornati: ' + invUpdated + '. Risparmiati ~' + Math.round(bytesSaved / 1024) + ' KB.';
+                    if (firstPermError) {
+                        summary += ' | PERMESSO NEGATO su item_images: login gestore con Firebase Auth obbligatorio.';
+                    }
+                    if (statusEl) statusEl.textContent = summary;
+                    if (firstPermError) {
+                        showToast('Permesso negato su item_images. Devi essere autenticato come gestore.', 'error');
+                    } else {
+                        showToast(
+                            'Ottimizzazione: ' + done + ' immagini · ~' + Math.round(bytesSaved / 1024) + ' KB · ' + invUpdated + ' item',
+                            failed ? 'warning' : 'success'
+                        );
+                    }
+                })().catch(function (err) {
+                    console.error('runOptimize', err);
+                    showToast('Errore ottimizzazione: ' + (err && err.message ? err.message : err), 'error');
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.innerHTML = '<i class="fa-solid fa-compress mr-1"></i> Ottimizza immagini esistenti + aggiorna item';
+                    }
+                    if (statusEl) statusEl.textContent = 'Errore: ' + (err && err.message ? err.message : err);
+                });
+            },
+            false
+        );
+    } catch (err) {
+        console.error('optimizeExistingItemImages', err);
+        showToast('Errore: ' + (err && err.message ? err.message : err), 'error');
+        if (statusEl) statusEl.textContent = 'Errore: ' + (err && err.message ? err.message : err);
+    }
 };
+
+// Bind sicuro del pulsante (oltre a onclick inline)
+document.getElementById('item-image-optimize-btn')?.addEventListener('click', function (e) {
+    e.preventDefault();
+    if (typeof window.optimizeExistingItemImages === 'function') {
+        window.optimizeExistingItemImages();
+    } else {
+        showToast('Funzione ottimizzazione non caricata. Ricarica la pagina (Ctrl+F5).', 'error');
+    }
+});
 
 
 // --- EMPLOYEE DROPDOWNS ---
