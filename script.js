@@ -699,20 +699,34 @@ function isSectionVisible(section) {
 function isAdminOpen() {
     return currentSectionId === 'admin' && userRole === 'gestore';
 }
+/** Coda UI debounced: evita raffiche di re-render da più onSnapshot contemporanei */
+let _uiQueue = [];
+let _uiScheduled = false;
 function scheduleUI(fn, delay) {
-    const run = function () {
-        try { fn(); } catch (e) { console.error(e); }
-    };
-    if (delay && delay > 0) {
-        setTimeout(function () {
-            if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 600 });
-            else run();
-        }, delay);
-    } else if (typeof requestIdleCallback === 'function') {
-        requestIdleCallback(run, { timeout: 400 });
-    } else {
-        setTimeout(run, 0);
-    }
+    if (typeof fn !== 'function') return;
+    _uiQueue.push(fn);
+    if (_uiScheduled) return;
+    _uiScheduled = true;
+    const wait = (delay && delay > 0) ? delay : 40;
+    setTimeout(function () {
+        const batch = _uiQueue.slice();
+        _uiQueue = [];
+        _uiScheduled = false;
+        const run = function () {
+            // dedupe per reference
+            const seen = new Set();
+            batch.forEach(function (f) {
+                if (seen.has(f)) return;
+                seen.add(f);
+                try { f(); } catch (e) { console.error(e); }
+            });
+        };
+        if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(run, { timeout: 500 });
+        } else {
+            run();
+        }
+    }, wait);
 }
 
 function refreshActiveSectionUI() {
@@ -1098,6 +1112,74 @@ if (stashForm) {
 
 // --- LIBRERIA IMMAGINI ITEM (onclick sul bottone, niente form) ---
 const MAX_ITEM_IMAGE_BYTES = 400 * 1024;
+/** Lato massimo (px) dopo compressione — riduce peso e lag in inventario */
+const ITEM_IMAGE_MAX_SIDE = 256;
+/** Qualità JPEG 0–1 (più basso = file più leggeri) */
+const ITEM_IMAGE_JPEG_QUALITY = 0.72;
+/** Soglia sotto cui non ricomprimiamo di nuovo (già ottimizzate) */
+const ITEM_IMAGE_SKIP_IF_UNDER = 45 * 1024;
+
+/**
+ * Comprime un File/Blob o dataURL in JPEG ridimensionato (canvas).
+ * Ritorna { dataUrl, sizeApprox, width, height }.
+ */
+function compressImageSource(source, maxSide, quality) {
+    maxSide = maxSide || ITEM_IMAGE_MAX_SIDE;
+    quality = quality == null ? ITEM_IMAGE_JPEG_QUALITY : quality;
+    return new Promise(function (resolve, reject) {
+        var img = new Image();
+        var objectUrl = null;
+        img.onload = function () {
+            try {
+                if (objectUrl) URL.revokeObjectURL(objectUrl);
+                var w = img.naturalWidth || img.width;
+                var h = img.naturalHeight || img.height;
+                if (!w || !h) {
+                    reject(new Error('Dimensioni immagine non valide'));
+                    return;
+                }
+                var scale = 1;
+                if (w > maxSide || h > maxSide) {
+                    scale = maxSide / Math.max(w, h);
+                }
+                var nw = Math.max(1, Math.round(w * scale));
+                var nh = Math.max(1, Math.round(h * scale));
+                var canvas = document.createElement('canvas');
+                canvas.width = nw;
+                canvas.height = nh;
+                var ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#1a0f18';
+                ctx.fillRect(0, 0, nw, nh);
+                ctx.drawImage(img, 0, 0, nw, nh);
+                var dataUrl = canvas.toDataURL('image/jpeg', quality);
+                var b64 = dataUrl.indexOf(',') >= 0 ? dataUrl.split(',')[1] : dataUrl;
+                var sizeApprox = Math.round((b64.length * 3) / 4);
+                resolve({ dataUrl: dataUrl, sizeApprox: sizeApprox, width: nw, height: nh });
+            } catch (e) {
+                if (objectUrl) URL.revokeObjectURL(objectUrl);
+                reject(e);
+            }
+        };
+        img.onerror = function () {
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+            reject(new Error('Impossibile caricare immagine'));
+        };
+        if (typeof source === 'string') {
+            img.src = source;
+        } else if (source && (source instanceof Blob || source instanceof File)) {
+            objectUrl = URL.createObjectURL(source);
+            img.src = objectUrl;
+        } else {
+            reject(new Error('Sorgente immagine non supportata'));
+        }
+    });
+}
+
+function estimateDataUrlBytes(dataUrl) {
+    if (!dataUrl || typeof dataUrl !== 'string') return 0;
+    var b64 = dataUrl.indexOf(',') >= 0 ? dataUrl.split(',')[1] : dataUrl;
+    return Math.round((b64.length * 3) / 4);
+}
 
 function renderItemImageSelects() {
     const opts = ['<option value="">— Nessuna / placeholder —</option>'];
@@ -1125,17 +1207,21 @@ function renderItemImagesLibrary() {
         return;
     }
     keys.sort(function (a, b) { return (localItemImages[b].createdAt || 0) - (localItemImages[a].createdAt || 0); });
-    grid.innerHTML = '';
+    const frag = document.createDocumentFragment();
     keys.forEach(function (id) {
         const img = localItemImages[id];
         const name = img.fileName || 'file.png';
+        const bytes = img.size || estimateDataUrlBytes(img.dataUrl);
+        const kbLabel = bytes ? (Math.round(bytes / 1024) + ' KB') : '';
         const card = document.createElement('div');
         card.className = 'relative bg-gray-900 border border-gray-700 rounded-xl overflow-hidden group';
         card.innerHTML =
             '<div class="h-20 flex items-center justify-center bg-gray-950 p-2">' +
-            '<img src="' + (img.dataUrl || '') + '" alt="" class="max-h-full max-w-full object-contain">' +
+            '<img src="' + (img.dataUrl || '') + '" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain">' +
             '</div><div class="p-2 border-t border-gray-800">' +
-            '<p class="text-[11px] text-amber-400 font-mono truncate">' + name + '</p></div>' +
+            '<p class="text-[11px] text-amber-400 font-mono truncate">' + name + '</p>' +
+            (kbLabel ? '<p class="text-[10px] text-gray-500">' + kbLabel + '</p>' : '') +
+            '</div>' +
             '<button type="button" class="absolute top-1 right-1 p-1 bg-red-600/90 hover:bg-red-700 text-white rounded-lg text-[10px] opacity-0 group-hover:opacity-100 transition" title="Elimina"><i class="fa-solid fa-trash"></i></button>';
         card.querySelector('button').addEventListener('click', function () {
             showConfirmModal('Elimina immagine', 'Rimuovere "' + name + '" dalla libreria?', function () {
@@ -1144,8 +1230,10 @@ function renderItemImagesLibrary() {
                     .catch(function (err) { showToast(err.message, 'error'); });
             }, true);
         });
-        grid.appendChild(card);
+        frag.appendChild(card);
     });
+    grid.innerHTML = '';
+    grid.appendChild(frag);
 }
 
 function readFileAsDataURL(file) {
@@ -1158,7 +1246,6 @@ function readFileAsDataURL(file) {
 }
 
 window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
-    console.log('[Fenici] upload immagini avviato', { role: userRole });
     try {
         if (userRole !== 'gestore') {
             showToast('Solo il gestore può caricare immagini. Accedi come gestore.', 'error');
@@ -1167,7 +1254,7 @@ window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
         var fileInput = document.getElementById('item-image-file');
         var files = fileInput && fileInput.files ? Array.from(fileInput.files) : [];
         if (files.length === 0) {
-            showToast('Seleziona uno o più file PNG prima di caricare.', 'warning');
+            showToast('Seleziona uno o più file immagine (PNG/JPG) prima di caricare.', 'warning');
             return;
         }
 
@@ -1176,11 +1263,11 @@ window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
         var prevHtml = btn ? btn.innerHTML : '';
         if (btn) {
             btn.disabled = true;
-            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Carico...';
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Comprimi e carico...';
         }
         if (statusEl) {
             statusEl.classList.remove('hidden');
-            statusEl.textContent = 'Caricamento in corso...';
+            statusEl.textContent = 'Compressione e caricamento in corso...';
         }
 
         var ok = 0, skip = 0, fail = 0;
@@ -1191,27 +1278,39 @@ window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
         for (var i = 0; i < files.length; i++) {
             var file = files[i];
             if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> ' + (i + 1) + '/' + files.length;
-            if (statusEl) statusEl.textContent = 'Carico ' + (i + 1) + ' di ' + files.length + ': ' + file.name;
+            if (statusEl) statusEl.textContent = 'Comprimo ' + (i + 1) + ' di ' + files.length + ': ' + file.name;
 
-            var isPng = file.type === 'image/png' || /\.png$/i.test(file.name);
-            if (!isPng) { skip++; continue; }
-            if (file.size > MAX_ITEM_IMAGE_BYTES) {
-                showToast('"' + file.name + '" troppo grande (' + Math.round(file.size / 1024) + ' KB). Max 400 KB.', 'warning');
+            var isImg = (file.type && file.type.indexOf('image/') === 0) || /\.(png|jpe?g|webp|gif)$/i.test(file.name);
+            if (!isImg) { skip++; continue; }
+            if (file.size > 8 * 1024 * 1024) {
+                showToast('"' + file.name + '" troppo grande (' + Math.round(file.size / 1024) + ' KB). Max 8 MB in input.', 'warning');
                 skip++;
                 continue;
             }
-            var baseName = file.name.replace(/[^\w.\-()+ ]+/g, '_');
-            if (existingNames.has(baseName.toLowerCase())) {
+            var baseName = file.name.replace(/\.(png|jpe?g|webp|gif)$/i, '').replace(/[^\w.\-()+ ]+/g, '_') + '.jpg';
+            if (existingNames.has(baseName.toLowerCase()) || existingNames.has(file.name.toLowerCase())) {
                 showToast('"' + baseName + '" già in libreria, saltato.', 'info');
                 skip++;
                 continue;
             }
             try {
-                var dataUrl = await readFileAsDataURL(file);
+                var compressed = await compressImageSource(file, ITEM_IMAGE_MAX_SIDE, ITEM_IMAGE_JPEG_QUALITY);
+                if (compressed.sizeApprox > MAX_ITEM_IMAGE_BYTES) {
+                    // secondo passaggio più aggressivo
+                    compressed = await compressImageSource(file, 192, 0.55);
+                }
+                if (compressed.sizeApprox > MAX_ITEM_IMAGE_BYTES) {
+                    showToast('"' + file.name + '" ancora troppo grande dopo compressione.', 'warning');
+                    skip++;
+                    continue;
+                }
                 await db.collection('item_images').add({
                     fileName: baseName,
-                    dataUrl: dataUrl,
-                    size: file.size,
+                    dataUrl: compressed.dataUrl,
+                    size: compressed.sizeApprox,
+                    width: compressed.width,
+                    height: compressed.height,
+                    optimized: true,
                     createdAt: Date.now()
                 });
                 existingNames.add(baseName.toLowerCase());
@@ -1232,11 +1331,11 @@ window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
         if (btn) { btn.disabled = false; btn.innerHTML = prevHtml; }
         if (statusEl) {
             statusEl.textContent = ok > 0
-                ? ('Completato: ' + ok + ' caricate' + (skip ? ', ' + skip + ' saltate' : '') + '.')
+                ? ('Completato: ' + ok + ' caricate (comresse)' + (skip ? ', ' + skip + ' saltate' : '') + '.')
                 : 'Nessuna immagine nuova caricata.';
         }
 
-        if (ok > 0) showToast('Caricate ' + ok + ' immagini' + (skip ? ' (' + skip + ' saltate)' : '') + '.', 'success');
+        if (ok > 0) showToast('Caricate ' + ok + ' immagini ottimizzate' + (skip ? ' (' + skip + ' saltate)' : '') + '.', 'success');
         else if (skip > 0 && fail === 0) showToast('Nessuna nuova immagine (già presenti o non valide).', 'warning');
         else if (fail > 0) showToast('Caricamento fallito. Vedi console (F12).', 'error');
     } catch (err) {
@@ -1245,9 +1344,158 @@ window.uploadItemImagesFromInput = async function uploadItemImagesFromInput() {
         var btn2 = document.getElementById('item-image-upload-btn');
         if (btn2) {
             btn2.disabled = false;
-            btn2.innerHTML = '<i class="fa-solid fa-upload mr-1"></i> Carica PNG';
+            btn2.innerHTML = '<i class="fa-solid fa-upload mr-1"></i> Carica immagini';
         }
     }
+};
+
+/**
+ * Ottimizza tutte le immagini già in libreria e riscrive gli item inventario che le usano.
+ * Riduce drasticamente il peso dei dataUrl in Firestore e il lag del browser.
+ */
+window.optimizeExistingItemImages = async function optimizeExistingItemImages() {
+    if (userRole !== 'gestore') {
+        showToast('Solo il gestore può ottimizzare le immagini.', 'error');
+        return;
+    }
+    var ids = Object.keys(localItemImages);
+    if (ids.length === 0) {
+        showToast('Nessuna immagine in libreria.', 'warning');
+        return;
+    }
+    showConfirmModal(
+        'Ottimizza immagini esistenti',
+        'Comprimerò fino a ' + ids.length + ' immagini (max ' + ITEM_IMAGE_MAX_SIDE + 'px, JPEG) e aggiornerò gli oggetti in inventario che le usano. Può richiedere 1–2 minuti. Continuare?',
+        async function () {
+            var statusEl = document.getElementById('item-image-status');
+            var btn = document.getElementById('item-image-optimize-btn');
+            var prevHtml = btn ? btn.innerHTML : '';
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Ottimizzo...';
+            }
+            if (statusEl) {
+                statusEl.classList.remove('hidden');
+                statusEl.textContent = 'Ottimizzazione in corso...';
+            }
+            var done = 0, skipped = 0, failed = 0, bytesSaved = 0;
+            var mapOldToNew = {}; // old dataUrl -> new dataUrl (solo se cambiato)
+
+            for (var i = 0; i < ids.length; i++) {
+                var id = ids[i];
+                var rec = localItemImages[id];
+                if (!rec || !rec.dataUrl) { skipped++; continue; }
+                if (statusEl) statusEl.textContent = 'Ottimizzo ' + (i + 1) + '/' + ids.length + ': ' + (rec.fileName || id);
+                if (btn) btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> ' + (i + 1) + '/' + ids.length;
+
+                var oldSize = rec.size || estimateDataUrlBytes(rec.dataUrl);
+                if (rec.optimized && oldSize > 0 && oldSize < ITEM_IMAGE_SKIP_IF_UNDER) {
+                    skipped++;
+                    continue;
+                }
+                try {
+                    var out = await compressImageSource(rec.dataUrl, ITEM_IMAGE_MAX_SIDE, ITEM_IMAGE_JPEG_QUALITY);
+                    if (out.sizeApprox >= oldSize * 0.95 && oldSize < MAX_ITEM_IMAGE_BYTES) {
+                        // guadagno minimo: marca comunque optimized se già piccola
+                        if (!rec.optimized) {
+                            await db.collection('item_images').doc(id).set({ optimized: true, size: oldSize }, { merge: true });
+                        }
+                        skipped++;
+                        continue;
+                    }
+                    var newFileName = (rec.fileName || 'img').replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.jpg';
+                    await db.collection('item_images').doc(id).set({
+                        fileName: newFileName,
+                        dataUrl: out.dataUrl,
+                        size: out.sizeApprox,
+                        width: out.width,
+                        height: out.height,
+                        optimized: true,
+                        optimizedAt: Date.now()
+                    }, { merge: true });
+                    mapOldToNew[rec.dataUrl] = out.dataUrl;
+                    mapOldToNew['fn:' + (rec.fileName || '').toLowerCase()] = out.dataUrl;
+                    mapOldToNew['fn:' + newFileName.toLowerCase()] = out.dataUrl;
+                    bytesSaved += Math.max(0, oldSize - out.sizeApprox);
+                    done++;
+                } catch (err) {
+                    console.error('optimize image', id, err);
+                    failed++;
+                }
+                // yield al browser per non bloccare UI
+                await new Promise(function (r) { setTimeout(r, 30); });
+            }
+
+            // Aggiorna inventory_items (e fenici se presenti) che puntano alle vecchie dataUrl / fileName
+            function resolveNewUrl(d) {
+                if (d.imageUrl && mapOldToNew[d.imageUrl]) return mapOldToNew[d.imageUrl];
+                if (d.imageFileName) {
+                    var fn = String(d.imageFileName).toLowerCase();
+                    if (mapOldToNew['fn:' + fn]) return mapOldToNew['fn:' + fn];
+                    var base = fn.replace(/\.(png|jpe?g|webp|gif)$/i, '');
+                    if (mapOldToNew['fn:' + base + '.jpg']) return mapOldToNew['fn:' + base + '.jpg'];
+                    if (mapOldToNew['fn:' + base + '.png']) return mapOldToNew['fn:' + base + '.png'];
+                }
+                return null;
+            }
+            async function commitInChunks(updates) {
+                for (var i = 0; i < updates.length; i += 400) {
+                    var slice = updates.slice(i, i + 400);
+                    var b = db.batch();
+                    slice.forEach(function (u) { b.update(u.ref, u.patch); });
+                    await b.commit();
+                }
+            }
+            var invUpdated = 0;
+            try {
+                var invSnap = await db.collection('inventory_items').get();
+                var updates = [];
+                invSnap.forEach(function (doc) {
+                    var d = doc.data() || {};
+                    var newUrl = resolveNewUrl(d);
+                    if (newUrl) {
+                        var patch = { imageUrl: newUrl };
+                        if (d.imageFileName) {
+                            patch.imageFileName = String(d.imageFileName).replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.jpg';
+                        }
+                        updates.push({ ref: doc.ref, patch: patch });
+                        invUpdated++;
+                    }
+                });
+                if (updates.length) await commitInChunks(updates);
+            } catch (errInv) {
+                console.warn('update inventory after optimize', errInv);
+            }
+
+            // fenici_items opzionale
+            try {
+                var fenSnap = await db.collection('fenici_items').get();
+                var updates2 = [];
+                fenSnap.forEach(function (doc) {
+                    var d = doc.data() || {};
+                    var newUrl = resolveNewUrl(d);
+                    if (newUrl) {
+                        updates2.push({ ref: doc.ref, patch: { imageUrl: newUrl } });
+                        invUpdated++;
+                    }
+                });
+                if (updates2.length) await commitInChunks(updates2);
+            } catch (_) { /* collezione forse assente */ }
+
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = prevHtml || '<i class="fa-solid fa-compress mr-1"></i> Ottimizza immagini esistenti';
+            }
+            if (statusEl) {
+                statusEl.textContent = 'Fatto: ' + done + ' ottimizzate, ' + skipped + ' già ok, ' + failed + ' errori. Item aggiornati: ' + invUpdated + '. Risparmiati ~' + Math.round(bytesSaved / 1024) + ' KB.';
+            }
+            showToast(
+                'Ottimizzazione completata: ' + done + ' immagini · ~' + Math.round(bytesSaved / 1024) + ' KB risparmiati · ' + invUpdated + ' item aggiornati',
+                failed ? 'warning' : 'success'
+            );
+        },
+        false
+    );
 };
 
 
@@ -1297,7 +1545,7 @@ document.getElementById('archive-window-fen-employee-filter')?.addEventListener(
 function renderQuickSalesYjGrid() {
     const container = document.getElementById('quick-sales-yj-grid');
     if (!container) return;
-    container.innerHTML = `
+    let html = `
         <div onclick="openSmartModal('sale_custom_yj', null)" class="bg-gray-800/80 border border-gray-600 rounded-xl p-4 cursor-pointer hover:border-amber-500 transition-all flex flex-col items-center justify-center text-center group min-h-[110px] shadow-lg">
             <div class="h-10 w-10 bg-amber-500/10 rounded-full flex items-center justify-center mb-2 group-hover:bg-amber-500 transition-colors">
                 <i class="fa-solid fa-plus text-xl text-amber-500 group-hover:text-gray-900"></i>
@@ -1307,7 +1555,7 @@ function renderQuickSalesYjGrid() {
     `;
     Object.keys(localCatalogYJ).forEach(key => {
         const item = localCatalogYJ[key];
-        container.innerHTML += `
+        html += `
             <div onclick="openSmartModal('sale_catalog_yj', '${key}')" class="bg-gray-800/80 border border-gray-600 rounded-xl p-4 cursor-pointer hover:border-emerald-500 transition-all flex flex-col items-center justify-center text-center group min-h-[110px] shadow-lg">
                 <i class="fa-solid fa-tag text-2xl text-gray-500 mb-2 group-hover:text-emerald-400"></i>
                 <span class="font-bold text-gray-200 text-sm leading-tight">${item.name}</span>
@@ -1315,6 +1563,7 @@ function renderQuickSalesYjGrid() {
             </div>
         `;
     });
+    container.innerHTML = html;
 }
 
 function renderQuickSalesFenGrid() {
@@ -1702,8 +1951,18 @@ function renderCatalogFen() {
 }
 
 // --- INVENTARIO YJ ---
-document.getElementById('inv-yj-search-filter')?.addEventListener('input', renderInventoryYjGrid);
-document.getElementById('inv-yj-stash-filter')?.addEventListener('change', renderInventoryYjGrid);
+(function () {
+    let invSearchTimer = null;
+    document.getElementById('inv-yj-search-filter')?.addEventListener('input', function () {
+        clearTimeout(invSearchTimer);
+        invSearchTimer = setTimeout(function () {
+            if (typeof renderInventoryYjGrid === 'function') renderInventoryYjGrid();
+        }, 180);
+    });
+    document.getElementById('inv-yj-stash-filter')?.addEventListener('change', function () {
+        if (typeof renderInventoryYjGrid === 'function') renderInventoryYjGrid();
+    });
+})();
 
 function renderInventoryYjDropdowns() {
     const sel = document.getElementById('inv-yj-item-select');
@@ -1718,7 +1977,6 @@ function renderInventoryYjDropdowns() {
 function renderInventoryYjGrid() {
     const grid = document.getElementById('inventory-yj-grid');
     if (!grid) return;
-    grid.innerHTML = '';
     const searchVal = (document.getElementById('inv-yj-search-filter')?.value || '').toLowerCase();
     const stashVal = document.getElementById('inv-yj-stash-filter')?.value || 'all';
     let items = Object.keys(localInventoryYJ).map(k => ({ id: k, ...localInventoryYJ[k] }));
@@ -1728,20 +1986,23 @@ function renderInventoryYjGrid() {
         grid.innerHTML = `<div class="col-span-full text-center py-6 text-gray-500 text-sm">Nessun oggetto in inventario.</div>`;
         return;
     }
+    const frag = document.createDocumentFragment();
+    const tpl = document.createElement('div');
     items.forEach(item => {
         const stashLabel = getStashName(item.stash);
-        const safeName = (item.name || '').replace(/'/g, "\\'");
+        const safeName = (item.name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
         const delBtn = (userRole === 'gestore')
             ? `<button onclick="event.stopPropagation(); window.deleteInventoryItem('${item.id}', '${safeName}', true)" class="absolute top-2 right-2 p-1.5 bg-red-600/90 hover:bg-red-700 text-white rounded-lg text-xs z-20 opacity-0 group-hover:opacity-100 transition" title="Rimuovi"><i class="fa-solid fa-trash"></i></button>`
             : '';
-        grid.innerHTML += `
-            <div onclick="openSmartModal('inv_yj', '${item.id}')" class="relative bg-gray-800 rounded-xl border border-gray-700 overflow-hidden shadow-lg flex flex-col group cursor-pointer hover:border-amber-500 transition-all">
+        const imgSrc = item.imageUrl || 'https://via.placeholder.com/150?text=No+Immagine';
+        tpl.innerHTML = `
+            <div onclick="openSmartModal('inv_yj', '${item.id}')" class="relative bg-gray-800 rounded-xl border border-gray-700 overflow-hidden shadow-lg flex flex-col group cursor-pointer hover:border-amber-500 transition-all inv-card">
                 ${delBtn}
                 <div class="h-32 w-full bg-gray-900/80 flex items-center justify-center p-3">
-                    <img src="${item.imageUrl || 'https://via.placeholder.com/150?text=No+Immagine'}" alt="${item.name}" class="max-h-full max-w-full object-contain drop-shadow-md group-hover:scale-105 transition duration-200" onerror="this.src='https://via.placeholder.com/150?text=No+Immagine';">
+                    <img src="${imgSrc}" alt="" loading="lazy" decoding="async" width="128" height="128" class="max-h-full max-w-full object-contain drop-shadow-md group-hover:scale-105 transition duration-200" onerror="this.onerror=null;this.src='https://via.placeholder.com/150?text=No+Immagine';">
                 </div>
                 <div class="p-3 pt-2 flex flex-col gap-1.5 border-t border-gray-700/60">
-                    <h4 class="font-bold text-amber-400 text-sm leading-snug truncate" title="${item.name}">${item.name}</h4>
+                    <h4 class="font-bold text-amber-400 text-sm leading-snug truncate" title="${safeName}">${item.name || ''}</h4>
                     <div class="flex items-baseline gap-1.5">
                         <span class="text-[11px] text-gray-400 font-medium">Qta:</span>
                         <span class="text-emerald-400 font-bold text-sm tabular-nums">${formatNumero(item.quantity)}</span>
@@ -1750,7 +2011,10 @@ function renderInventoryYjGrid() {
                 </div>
             </div>
         `;
+        while (tpl.firstChild) frag.appendChild(tpl.firstChild);
     });
+    grid.innerHTML = '';
+    grid.appendChild(frag);
 }
 
 function renderInventoryYjLogs() {

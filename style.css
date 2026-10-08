@@ -225,13 +225,37 @@ footer { border-top: 1px solid rgba(168, 85, 247, 0.2) !important; background: #
 .inv-logs-scroll { max-height: min(40vh, 380px) !important; min-height: 180px !important; }
 
 
-/* Card inventario: layout lineare */
+/* Card inventario: layout lineare + performance */
 #inventory-yj-grid > div {
     min-height: 0;
+    contain: layout style paint;
 }
 #inventory-yj-grid > div h4 {
     line-height: 1.25;
 }
+#inventory-yj-grid img,
+#item-images-grid img {
+    content-visibility: auto;
+    max-width: 100%;
+    height: auto;
+}
+#inventory-yj-grid,
+#item-images-grid,
+#quick-sales-yj-grid {
+    contain: layout style;
+}
+.inv-giacenza-scroll,
+.inv-logs-scroll {
+    content-visibility: auto;
+}
 #saldo-amount-display {
     letter-spacing: -0.02em;
+}
+
+/* Riduce lavoro su sezioni nascoste */
+#sales-yj-section.hidden,
+#inventory-yj-section.hidden,
+#saldo-section.hidden,
+#admin-section.hidden {
+    content-visibility: hidden;
 }
