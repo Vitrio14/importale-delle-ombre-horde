@@ -92,6 +92,67 @@ function getStartOfCurrentWeek() {
     return monday.getTime();
 }
 
+
+/** Ruoli effettivi del dipendente loggato (default backward-compat) */
+function getStaffRoles() {
+    const raw = (staffSession && staffSession.roles) || (currentEmployeeData && currentEmployeeData.roles) || {};
+    return {
+        salesYJ: raw.salesYJ !== false && raw.salesYJ !== 'false' && raw.salesYJ !== 0,
+        invYJ: raw.invYJ !== false && raw.invYJ !== 'false' && raw.invYJ !== 0,
+        saldo: !!(raw.saldo === true || raw.saldo === 'true' || raw.saldo === 1)
+    };
+}
+
+function canAccessSales() {
+    if (userRole === 'gestore') return true;
+    if (userRole === 'dipendente') return getStaffRoles().salesYJ;
+    return false;
+}
+
+function canAccessInventory() {
+    if (userRole === 'gestore') return true;
+    if (userRole === 'dipendente') return getStaffRoles().invYJ;
+    return false;
+}
+
+/** True se gestore o dipendente con roles.saldo */
+function canAccessSaldo() {
+    if (userRole === 'gestore') return true;
+    if (userRole === 'dipendente') return getStaffRoles().saldo;
+    return false;
+}
+
+/** Aggiorna saldo + log in transazione (evita race / doppi accrediti) */
+function applyBalanceDelta(delta, meta) {
+    const balRef = db.collection('balance').doc('current');
+    const logRef = db.collection('balance_logs').doc();
+    const now = Date.now();
+    return db.runTransaction(async (tx) => {
+        const snap = await tx.get(balRef);
+        const prev = (snap.exists && typeof snap.data().amount === 'number') ? snap.data().amount : 0;
+        let newAmount = prev + delta;
+        if (newAmount < 0) newAmount = 0;
+        tx.set(balRef, {
+            amount: newAmount,
+            updatedAt: now,
+            updatedBy: meta.operatorName || 'Sistema'
+        }, { merge: true });
+        tx.set(logRef, {
+            timestamp: now,
+            dateString: new Date(now).toLocaleString('it-IT'),
+            operatorName: meta.operatorName || 'Sistema',
+            employeeId: meta.employeeId != null ? meta.employeeId : null,
+            type: meta.type || 'movimento',
+            prevAmount: prev,
+            newAmount: newAmount,
+            delta: delta,
+            note: meta.note || '',
+            saleId: meta.saleId || null
+        });
+        return { prev, newAmount, delta };
+    });
+}
+
 function getStashName(stashId) {
     if (localStashes[stashId]) return localStashes[stashId].name;
     return stashId || '—';
@@ -427,39 +488,38 @@ document.getElementById('smart-modal-form').addEventListener('submit', (e) => {
         // Accredita sul saldo SOLO il guadagno azienda (yellowGain), non la spettanza dipendente
         const yellowGain = saleData.yellowGain || 0;
         const operatorName = localEmployees[empId]?.name || 'Dipendente';
-        const now = Date.now();
-        const batch = db.batch();
-        const saleRef = db.collection(salesCollection).doc();
-        batch.set(saleRef, saleData);
-
-        if (yellowGain > 0) {
-            const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
-            const newAmount = prev + yellowGain;
-            batch.set(db.collection('balance').doc('current'), {
-                amount: newAmount,
-                updatedAt: now,
-                updatedBy: operatorName
-            }, { merge: true });
-            const qtyLabel = qty > 1 ? ' x' + qty : '';
-            batch.set(db.collection('balance_logs').doc(), {
-                timestamp: now,
-                dateString: new Date(now).toLocaleString('it-IT'),
-                operatorName: operatorName,
-                employeeId: empId,
-                type: 'vendita',
-                prevAmount: prev,
-                newAmount: newAmount,
-                delta: yellowGain,
-                note: 'Vendita: ' + saleData.serviceName + qtyLabel
-            });
+        const submitBtn = document.getElementById('smart-modal-submit');
+        if (submitBtn) {
+            if (submitBtn.dataset.busy === '1') return;
+            submitBtn.dataset.busy = '1';
+            submitBtn.disabled = true;
         }
+        const saleRef = db.collection(salesCollection).doc();
+        saleData.id = saleRef.id;
 
-        batch.commit()
+        const finishOk = () => {
+            if (submitBtn) { submitBtn.dataset.busy = '0'; submitBtn.disabled = false; }
+            closeSmartModal();
+            showToast("Vendita registrata!" + (yellowGain > 0 ? " (+ " + formatValuta(yellowGain) + " in cassa)" : ""), "success");
+        };
+        const finishErr = (err) => {
+            if (submitBtn) { submitBtn.dataset.busy = '0'; submitBtn.disabled = false; }
+            showToast("Errore: " + (err && err.message ? err.message : err), "error");
+        };
+
+        saleRef.set(saleData)
             .then(() => {
-                closeSmartModal();
-                showToast("Vendita registrata!" + (yellowGain > 0 ? " (+ " + formatValuta(yellowGain) + " in cassa)" : ""), "success");
+                if (yellowGain <= 0) return finishOk();
+                const qtyLabel = qty > 1 ? ' x' + qty : '';
+                return applyBalanceDelta(yellowGain, {
+                    operatorName,
+                    employeeId: empId,
+                    type: 'vendita',
+                    note: 'Vendita: ' + saleData.serviceName + qtyLabel,
+                    saleId: saleRef.id
+                }).then(finishOk);
             })
-            .catch(err => showToast("Errore: " + err.message, "error"));
+            .catch(finishErr);
     }
 });
 
@@ -570,7 +630,14 @@ loginStaffForm?.addEventListener('submit', async (e) => {
             id: foundId,
             name: found.name,
             login: found.login || found.name,
-            roles: found.roles || { salesYJ: true, invYJ: true },
+            roles: (function () {
+                const r = found.roles || {};
+                return {
+                    salesYJ: r.salesYJ !== false && r.salesYJ !== 'false' && r.salesYJ !== 0,
+                    invYJ: r.invYJ !== false && r.invYJ !== 'false' && r.invYJ !== 0,
+                    saldo: !!(r.saldo === true || r.saldo === 'true' || r.saldo === 1)
+                };
+            })(),
             customPercentage: found.customPercentage || 40
         }, found);
 
@@ -679,10 +746,10 @@ function setupUIForRole() {
         else btn.classList.add('hidden');
     };
 
-    // Vendite + Inventario + Saldo per tutti; Gestione solo gestore
-    show(navSalesYjBtn, true);
-    show(navInventoryYjBtn, true);
-    show(navSaldoBtn, true);
+    // Sezioni in base ai permessi del dipendente; Gestione solo gestore
+    show(navSalesYjBtn, canAccessSales());
+    show(navInventoryYjBtn, canAccessInventory());
+    show(navSaldoBtn, canAccessSaldo());
     show(navAdminBtn, isGestore);
     if (navSalesFenBtn) navSalesFenBtn.classList.add('hidden');
     if (navInventoryFenBtn) navInventoryFenBtn.classList.add('hidden');
@@ -695,7 +762,12 @@ function setupUIForRole() {
     document.getElementById('manager-sales-archive-yj-section')?.classList.toggle('hidden', !isGestore);
     document.getElementById('sales-yj-employee-filter')?.classList.toggle('hidden', !isGestore);
 
-    showSection('sales-yj');
+    // Apri la prima sezione a cui ha accesso
+    if (canAccessSales()) showSection('sales-yj');
+    else if (canAccessInventory()) showSection('inventory-yj');
+    else if (canAccessSaldo()) showSection('saldo');
+    else if (isGestore) showSection('admin');
+    else showToast('Nessuna sezione abilitata. Contatta il gestore.', 'warning');
 }
 
 // --- NAVIGAZIONE ---
@@ -790,6 +862,39 @@ function refreshActiveSectionUI() {
 }
 
 function showSection(section) {
+    function fallbackSection() {
+        if (canAccessSales()) return 'sales-yj';
+        if (canAccessInventory()) return 'inventory-yj';
+        if (canAccessSaldo()) return 'saldo';
+        if (userRole === 'gestore') return 'admin';
+        return null;
+    }
+
+    if (section === 'sales-yj' && !canAccessSales()) {
+        showToast('Non hai il permesso per la sezione Vendite.', 'warning');
+        const fb = fallbackSection();
+        if (fb && fb !== section) return showSection(fb);
+        return;
+    }
+    if (section === 'inventory-yj' && !canAccessInventory()) {
+        showToast('Non hai il permesso per la sezione Inventario.', 'warning');
+        const fb = fallbackSection();
+        if (fb && fb !== section) return showSection(fb);
+        return;
+    }
+    if (section === 'saldo' && !canAccessSaldo()) {
+        showToast('Non hai il permesso per la sezione Saldo.', 'warning');
+        const fb = fallbackSection();
+        if (fb && fb !== section) return showSection(fb);
+        return;
+    }
+    if (section === 'admin' && userRole !== 'gestore') {
+        showToast('Accesso riservato al gestore.', 'error');
+        const fb = fallbackSection();
+        if (fb) return showSection(fb);
+        return;
+    }
+
     currentSectionId = section;
     [salesYjSection, salesFenSection, inventoryYjSection, inventoryFenSection, saldoSection, adminSection].forEach(s => s && s.classList.add('hidden'));
     
@@ -837,6 +942,25 @@ function initDatabaseListeners() {
     db.collection('employees').onSnapshot(snapshot => {
         localEmployees = {};
         snapshot.forEach(doc => { localEmployees[doc.id] = doc.data(); });
+        // Aggiorna in tempo reale i ruoli del dipendente loggato (es. permesso Saldo)
+        if (userRole === 'dipendente' && currentEmployeeId && localEmployees[currentEmployeeId]) {
+            const d = localEmployees[currentEmployeeId];
+            currentEmployeeData = d;
+            if (staffSession) {
+                const r = d.roles || {};
+                staffSession.roles = {
+                    salesYJ: r.salesYJ !== false && r.salesYJ !== 'false' && r.salesYJ !== 0,
+                    invYJ: r.invYJ !== false && r.invYJ !== 'false' && r.invYJ !== 0,
+                    saldo: !!(r.saldo === true || r.saldo === 'true' || r.saldo === 1)
+                };
+                staffSession.customPercentage = d.customPercentage != null ? d.customPercentage : staffSession.customPercentage;
+                staffSession.name = d.name || staffSession.name;
+                try { sessionStorage.setItem('fenici_staff_session', JSON.stringify(staffSession)); } catch (_) {}
+            }
+            scheduleUI(function () {
+                if (typeof setupUIForRole === 'function') setupUIForRole();
+            });
+        }
         scheduleUI(function () {
             if (typeof renderAllEmployeeDropdowns === 'function') renderAllEmployeeDropdowns();
             if (typeof renderAdminFilterDropdown === 'function') renderAdminFilterDropdown();
@@ -1787,11 +1911,25 @@ function handleSaleSubmit(e, isYJ) {
         saleData.employeeGain = employeeGain;
     }
 
-    db.collection(collection).add(saleData)
+    const yellowGain = saleData.yellowGain || 0;
+    const operatorName = localEmployees[empKey]?.name || 'Dipendente';
+    const saleRef = db.collection(collection).doc();
+    saleData.id = saleRef.id;
+    saleRef.set(saleData)
+        .then(() => {
+            if (yellowGain <= 0) return null;
+            return applyBalanceDelta(yellowGain, {
+                operatorName,
+                employeeId: empKey,
+                type: 'vendita',
+                note: 'Vendita: ' + saleData.serviceName + (quantity > 1 ? ' x' + quantity : ''),
+                saleId: saleRef.id
+            });
+        })
         .then(() => {
             e.target.reset();
             qtyInput.value = "1";
-            showToast("Vendita registrata!", "success");
+            showToast("Vendita registrata!" + (yellowGain > 0 ? " (+ " + formatValuta(yellowGain) + " in cassa)" : ""), "success");
         })
         .catch(err => showToast("Errore: " + err.message, "error"));
 }
@@ -1825,9 +1963,9 @@ function renderSalesTableGeneric(tbodyId, salesObj, filterId, isYJ) {
                 <td class="py-3">${totaleCell}</td>
                 <td class="py-3 text-indigo-400 font-semibold">${spettCell}</td>
                 <td class="py-3 text-right">
-                    <button onclick="window.deleteSaleItem('${sale.key}', true)" class="p-1 bg-red-600/20 text-red-400 rounded hover:bg-red-600 hover:text-white transition" title="Elimina">
+                    ${userRole === 'gestore' ? `<button onclick="window.deleteSaleItem('${sale.key}', ${isYJ})" class="p-1 bg-red-600/20 text-red-400 rounded hover:bg-red-600 hover:text-white transition" title="Annulla (storno)">
                         <i class="fa-solid fa-trash text-[10px]"></i>
-                    </button>
+                    </button>` : ''}
                 </td>
             </tr>
         `;
@@ -1843,40 +1981,35 @@ function renderSalesFenTable() {
 }
 
 window.deleteSaleItem = function(key, isYJ) {
+    if (userRole !== 'gestore') {
+        showToast('Solo il gestore può annullare una vendita (storno).', 'error');
+        return;
+    }
     const sales = isYJ ? localSalesYJ : localSalesFen;
     const collection = isYJ ? 'current_sales' : 'current_sales_fen';
     const sale = sales[key];
     if (!sale) return;
-    showConfirmModal("Elimina Vendita", `Eliminare la vendita di "${sale.serviceName}" di ${sale.employeeName}?`, () => {
+    if (sale._deleting) return;
+    showConfirmModal("Elimina Vendita", `Eliminare la vendita di "${sale.serviceName}" di ${sale.employeeName}? Verrà registrato uno STORNO sul saldo.`, () => {
         const yellowGain = sale.yellowGain || 0;
-        const batch = db.batch();
-        batch.delete(db.collection(collection).doc(key));
-        // Storno dal saldo del solo guadagno azienda (se presente)
-        if (yellowGain > 0) {
-            const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
-            const newAmount = Math.max(0, prev - yellowGain);
-            const now = Date.now();
-            const operatorName = sale.employeeName || 'Sistema';
-            batch.set(db.collection('balance').doc('current'), {
-                amount: newAmount,
-                updatedAt: now,
-                updatedBy: operatorName
-            }, { merge: true });
-            batch.set(db.collection('balance_logs').doc(), {
-                timestamp: now,
-                dateString: new Date(now).toLocaleString('it-IT'),
-                operatorName: operatorName,
-                employeeId: sale.employeeKey || null,
-                type: 'storno',
-                prevAmount: prev,
-                newAmount: newAmount,
-                delta: -yellowGain,
-                note: 'Annullamento vendita: ' + (sale.serviceName || '—')
-            });
-        }
-        batch.commit()
-            .then(() => showToast("Vendita rimossa." + (yellowGain > 0 ? " Storno cassa: " + formatValuta(yellowGain) : ""), "info"))
-            .catch(err => showToast(err.message, "error"));
+        sale._deleting = true;
+        const operatorName = (currentUser && currentUser.email) ? currentUser.email : 'Gestore';
+        db.collection(collection).doc(key).delete()
+            .then(() => {
+                if (yellowGain <= 0) {
+                    showToast("Vendita rimossa.", "info");
+                    return;
+                }
+                return applyBalanceDelta(-yellowGain, {
+                    operatorName,
+                    employeeId: sale.employeeKey || null,
+                    type: 'storno',
+                    note: 'Annullamento vendita: ' + (sale.serviceName || '—'),
+                    saleId: key
+                }).then(() => showToast("Vendita rimossa. Storno cassa: " + formatValuta(yellowGain), "info"));
+            })
+            .catch(err => showToast(err.message, "error"))
+            .finally(() => { try { delete sale._deleting; } catch (_) {} });
     }, true);
 };
 
@@ -2312,6 +2445,12 @@ function resetEmployeeForm() {
     if (!employeeForm) return;
     employeeForm.reset();
     document.getElementById('emp-id').value = '';
+    const salesCb = document.getElementById('emp-role-sales');
+    const invCb = document.getElementById('emp-role-inv');
+    const saldoCb = document.getElementById('emp-role-saldo');
+    if (salesCb) salesCb.checked = true;
+    if (invCb) invCb.checked = true;
+    if (saldoCb) saldoCb.checked = false;
     if (empSubmitBtn) {
         empSubmitBtn.innerHTML = '<i class="fa-solid fa-user-plus mr-1"></i> Registra Nuovo Dipendente';
         empSubmitBtn.className = 'flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-xl transition';
@@ -2336,13 +2475,16 @@ if (employeeForm) {
             return;
         }
 
+        const salesPerm = !!(document.getElementById('emp-role-sales') && document.getElementById('emp-role-sales').checked);
+        const invPerm = !!(document.getElementById('emp-role-inv') && document.getElementById('emp-role-inv').checked);
+        const saldoPerm = !!(document.getElementById('emp-role-saldo') && document.getElementById('emp-role-saldo').checked);
         const empData = {
             name,
             rank,
             login,
             password,
             customPercentage: customPercentage !== "" ? parseInt(customPercentage) : null,
-            roles: { salesYJ: true, invYJ: true },
+            roles: { salesYJ: salesPerm, invYJ: invPerm, saldo: saldoPerm },
             updatedAt: Date.now()
         };
 
@@ -2377,6 +2519,14 @@ window.editEmployee = function(key) {
     document.getElementById('emp-login').value = emp.login || '';
     document.getElementById('emp-password').value = emp.password || '';
     document.getElementById('emp-percentage').value = emp.customPercentage != null ? emp.customPercentage : '';
+    const roles = emp.roles || {};
+    const salesCb = document.getElementById('emp-role-sales');
+    const invCb = document.getElementById('emp-role-inv');
+    const saldoCb = document.getElementById('emp-role-saldo');
+    // Default true per vendite/inventario se non impostati (compatibilità)
+    if (salesCb) salesCb.checked = roles.salesYJ !== false && roles.salesYJ !== 'false' && roles.salesYJ !== 0;
+    if (invCb) invCb.checked = roles.invYJ !== false && roles.invYJ !== 'false' && roles.invYJ !== 0;
+    if (saldoCb) saldoCb.checked = !!(roles.saldo === true || roles.saldo === 'true' || roles.saldo === 1);
 
     if (empSubmitBtn) {
         empSubmitBtn.innerHTML = '<i class="fa-solid fa-floppy-disk mr-1"></i> Salva Modifiche';
@@ -2411,12 +2561,18 @@ function renderEmployees() {
     tbody.innerHTML = '';
     const keys = Object.keys(localEmployees);
     if (keys.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="6" class="p-4 text-center text-gray-500 text-xs">Nessun dipendente.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" class="p-4 text-center text-gray-500 text-xs">Nessun dipendente.</td></tr>`;
         return;
     }
     keys.forEach(key => {
         const emp = localEmployees[key];
         const pct = emp.customPercentage ? `${emp.customPercentage}%` : '40%';
+        const roles = emp.roles || {};
+        const hasSales = roles.salesYJ !== false && roles.salesYJ !== 'false' && roles.salesYJ !== 0;
+        const hasInv = roles.invYJ !== false && roles.invYJ !== 'false' && roles.invYJ !== 0;
+        const hasSaldo = !!(roles.saldo === true || roles.saldo === 'true' || roles.saldo === 1);
+        const yes = '<span class="text-emerald-400 bg-emerald-500/15 px-2 py-0.5 rounded text-[10px] font-bold">SÌ</span>';
+        const no = '<span class="text-gray-500 bg-gray-700/50 px-2 py-0.5 rounded text-[10px]">NO</span>';
         tbody.innerHTML += `
             <tr class="border-b border-gray-700/80 hover:bg-gray-700/50 transition text-xs">
                 <td class="p-2.5 font-bold text-amber-400">${emp.name || '-'}</td>
@@ -2424,6 +2580,9 @@ function renderEmployees() {
                 <td class="p-2.5 text-gray-300 font-mono">${emp.login || '-'}</td>
                 <td class="p-2.5 text-gray-400 font-mono">${emp.password || '-'}</td>
                 <td class="p-2.5 text-indigo-400">${pct}</td>
+                <td class="p-2.5">${hasSales ? yes : no}</td>
+                <td class="p-2.5">${hasInv ? yes : no}</td>
+                <td class="p-2.5">${hasSaldo ? yes : no}</td>
                 <td class="p-2.5 text-right whitespace-nowrap space-x-1">
                     <button onclick="window.editEmployee('${key}')" class="p-1.5 bg-amber-500/20 text-amber-400 rounded-lg hover:bg-amber-500 hover:text-gray-900 transition" title="Modifica">
                         <i class="fa-solid fa-pen text-[10px]"></i>
@@ -2718,8 +2877,9 @@ function renderSaldoUI() {
     const tbody = document.getElementById('saldo-logs-table');
     if (!tbody) return;
     tbody.innerHTML = '';
+    const isGestore = userRole === 'gestore';
     if (!localBalanceLogs || localBalanceLogs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-gray-500 text-xs">Nessun movimento saldo.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-gray-500 text-xs">Nessun movimento saldo.</td></tr>';
         return;
     }
     localBalanceLogs.forEach(log => {
@@ -2738,6 +2898,12 @@ function renderSaldoUI() {
         } else {
             typeBadge = '<span class="text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded text-xs font-bold">📤 Preleva</span>';
         }
+        const logId = log.id || '';
+        const delBtn = (isGestore && logId)
+            ? `<button type="button" onclick="window.deleteBalanceLog('${logId}')" class="p-1.5 bg-red-600/20 text-red-400 rounded-lg hover:bg-red-600 hover:text-white transition" title="Elimina log">
+                    <i class="fa-solid fa-trash text-[10px]"></i>
+               </button>`
+            : '';
         tbody.innerHTML += `
             <tr class="hover:bg-gray-750/50 border-b border-gray-700">
                 <td class="p-3 text-xs text-gray-400 whitespace-nowrap">${log.dateString || '—'}</td>
@@ -2746,10 +2912,42 @@ function renderSaldoUI() {
                 <td class="p-3 font-bold text-sm ${isUp ? 'text-emerald-400' : 'text-amber-400'}">${deltaStr}</td>
                 <td class="p-3 text-gray-200 font-semibold text-sm">${formatValuta(log.newAmount)}</td>
                 <td class="p-3 text-gray-400 text-xs italic truncate max-w-[180px]">${log.note || '—'}</td>
+                <td class="p-3 text-right whitespace-nowrap">${delBtn}</td>
             </tr>
         `;
     });
 }
+
+/** Elimina un log movimento saldo (solo gestore). Non modifica il saldo attuale. */
+window.deleteBalanceLog = function(logId) {
+    if (userRole !== 'gestore') {
+        showToast('Solo il gestore può eliminare i log del saldo.', 'error');
+        return;
+    }
+    if (!logId) {
+        showToast('Log non valido.', 'error');
+        return;
+    }
+    const log = (localBalanceLogs || []).find(l => l.id === logId);
+    const label = log
+        ? ((log.type || 'movimento') + (log.note ? ' · ' + log.note : '') + ' · ' + (log.dateString || ''))
+        : logId;
+    showConfirmModal(
+        'Elimina movimento saldo',
+        'Eliminare questo log dalla cronologia?\n\n' + label + '\n\nAttenzione: il saldo attuale NON viene modificato (solo la riga del registro).',
+        () => {
+            return db.collection('balance_logs').doc(logId).delete()
+                .then(() => showToast('Log eliminato dalla cronologia.', 'info'))
+                .catch(err => {
+                    const msg = (err && String(err.message || err.code || '').includes('permission'))
+                        ? 'Permesso negato su balance_logs. Solo il gestore può eliminare (controlla le regole Firestore).'
+                        : ('Errore: ' + (err.message || err));
+                    showToast(msg, 'error');
+                });
+        },
+        true
+    );
+};
 
 document.getElementById('balance-admin-form')?.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -2763,28 +2961,25 @@ document.getElementById('balance-admin-form')?.addEventListener('submit', (e) =>
         showToast('Inserisci un importo valido (≥ 0).', 'warning');
         return;
     }
-    const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
     const operatorName = currentUser?.email || 'Gestore';
-    const now = Date.now();
-    const batch = db.batch();
     const balRef = db.collection('balance').doc('current');
-    batch.set(balRef, {
-        amount: val,
-        updatedAt: now,
-        updatedBy: operatorName
-    }, { merge: true });
     const logRef = db.collection('balance_logs').doc();
-    batch.set(logRef, {
-        timestamp: now,
-        dateString: new Date(now).toLocaleString('it-IT'),
-        operatorName,
-        type: 'set',
-        prevAmount: prev,
-        newAmount: val,
-        delta: val - prev,
-        note: note || 'Aggiornamento manuale saldo'
-    });
-    batch.commit()
+    const now = Date.now();
+    db.runTransaction(async (tx) => {
+        const snap = await tx.get(balRef);
+        const prev = (snap.exists && typeof snap.data().amount === 'number') ? snap.data().amount : 0;
+        tx.set(balRef, { amount: val, updatedAt: now, updatedBy: operatorName }, { merge: true });
+        tx.set(logRef, {
+            timestamp: now,
+            dateString: new Date(now).toLocaleString('it-IT'),
+            operatorName,
+            type: 'set',
+            prevAmount: prev,
+            newAmount: val,
+            delta: val - prev,
+            note: note || 'Aggiornamento manuale saldo'
+        });
+    })
         .then(() => {
             document.getElementById('balance-admin-value').value = '';
             document.getElementById('balance-admin-note').value = '';
@@ -2833,10 +3028,15 @@ function fillSaldoMovEmployeeSelect() {
 
 document.getElementById('saldo-movimento-form')?.addEventListener('submit', (e) => {
     e.preventDefault();
+    if (!canAccessSaldo()) {
+        showToast('Non hai il permesso per modificare il saldo.', 'error');
+        return;
+    }
     const empVal = document.getElementById('saldo-mov-employee')?.value;
     const action = document.getElementById('saldo-mov-action')?.value || 'preleva';
     const amount = parseFloat(document.getElementById('saldo-mov-amount')?.value);
     const note = (document.getElementById('saldo-mov-note')?.value || '').trim();
+    const submitBtn = e.target.querySelector('button[type="submit"]');
 
     if (!empVal) {
         showToast('Seleziona l\'operatore.', 'warning');
@@ -2855,39 +3055,25 @@ document.getElementById('saldo-movimento-form')?.addEventListener('submit', (e) 
     }
 
     const prev = (localBalance && typeof localBalance.amount === 'number') ? localBalance.amount : 0;
-    let newAmount = prev;
     let delta = 0;
     if (action === 'preleva') {
         if (amount > prev) {
             showToast('Importo superiore al saldo disponibile (' + formatValuta(prev) + ').', 'error');
             return;
         }
-        newAmount = prev - amount;
         delta = -amount;
     } else {
-        newAmount = prev + amount;
         delta = amount;
     }
 
-    const now = Date.now();
-    const batch = db.batch();
-    batch.set(db.collection('balance').doc('current'), {
-        amount: newAmount,
-        updatedAt: now,
-        updatedBy: operatorName
-    }, { merge: true });
-    batch.set(db.collection('balance_logs').doc(), {
-        timestamp: now,
-        dateString: new Date(now).toLocaleString('it-IT'),
+    if (submitBtn) { if (submitBtn.dataset.busy === '1') return; submitBtn.dataset.busy = '1'; submitBtn.disabled = true; }
+
+    applyBalanceDelta(delta, {
         operatorName,
         employeeId: empVal === '__gestore__' ? null : empVal,
         type: action === 'preleva' ? 'preleva' : 'deposita',
-        prevAmount: prev,
-        newAmount: newAmount,
-        delta: delta,
         note: note || (action === 'preleva' ? 'Prelievo crediti' : 'Deposito crediti')
-    });
-    batch.commit()
+    })
         .then(() => {
             document.getElementById('saldo-mov-amount').value = '';
             document.getElementById('saldo-mov-note').value = '';
@@ -2899,5 +3085,8 @@ document.getElementById('saldo-movimento-form')?.addEventListener('submit', (e) 
                 ? 'Permesso negato su balance/balance_logs. Aggiorna le regole Firestore.'
                 : ('Errore: ' + (err.message || err));
             showToast(msg, 'error');
+        })
+        .finally(() => {
+            if (submitBtn) { submitBtn.dataset.busy = '0'; submitBtn.disabled = false; }
         });
 });
