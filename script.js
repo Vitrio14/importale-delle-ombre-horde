@@ -485,9 +485,7 @@ document.getElementById('smart-modal-form').addEventListener('submit', (e) => {
             saleData.employeeGain = employeeGain;
         }
 
-        // Accredita sul saldo SOLO il guadagno azienda (yellowGain), non la spettanza dipendente
-        const yellowGain = saleData.yellowGain || 0;
-        const operatorName = localEmployees[empId]?.name || 'Dipendente';
+        // Le vendite NON modificano il saldo cassa (solo registro vendite / stipendi)
         const submitBtn = document.getElementById('smart-modal-submit');
         if (submitBtn) {
             if (submitBtn.dataset.busy === '1') return;
@@ -500,7 +498,7 @@ document.getElementById('smart-modal-form').addEventListener('submit', (e) => {
         const finishOk = () => {
             if (submitBtn) { submitBtn.dataset.busy = '0'; submitBtn.disabled = false; }
             closeSmartModal();
-            showToast("Vendita registrata!" + (yellowGain > 0 ? " (+ " + formatValuta(yellowGain) + " in cassa)" : ""), "success");
+            showToast("Vendita registrata!", "success");
         };
         const finishErr = (err) => {
             if (submitBtn) { submitBtn.dataset.busy = '0'; submitBtn.disabled = false; }
@@ -508,17 +506,7 @@ document.getElementById('smart-modal-form').addEventListener('submit', (e) => {
         };
 
         saleRef.set(saleData)
-            .then(() => {
-                if (yellowGain <= 0) return finishOk();
-                const qtyLabel = qty > 1 ? ' x' + qty : '';
-                return applyBalanceDelta(yellowGain, {
-                    operatorName,
-                    employeeId: empId,
-                    type: 'vendita',
-                    note: 'Vendita: ' + saleData.serviceName + qtyLabel,
-                    saleId: saleRef.id
-                }).then(finishOk);
-            })
+            .then(finishOk)
             .catch(finishErr);
     }
 });
@@ -1911,25 +1899,14 @@ function handleSaleSubmit(e, isYJ) {
         saleData.employeeGain = employeeGain;
     }
 
-    const yellowGain = saleData.yellowGain || 0;
-    const operatorName = localEmployees[empKey]?.name || 'Dipendente';
+    // Le vendite NON modificano il saldo cassa
     const saleRef = db.collection(collection).doc();
     saleData.id = saleRef.id;
     saleRef.set(saleData)
         .then(() => {
-            if (yellowGain <= 0) return null;
-            return applyBalanceDelta(yellowGain, {
-                operatorName,
-                employeeId: empKey,
-                type: 'vendita',
-                note: 'Vendita: ' + saleData.serviceName + (quantity > 1 ? ' x' + quantity : ''),
-                saleId: saleRef.id
-            });
-        })
-        .then(() => {
             e.target.reset();
             qtyInput.value = "1";
-            showToast("Vendita registrata!" + (yellowGain > 0 ? " (+ " + formatValuta(yellowGain) + " in cassa)" : ""), "success");
+            showToast("Vendita registrata!", "success");
         })
         .catch(err => showToast("Errore: " + err.message, "error"));
 }
@@ -1963,7 +1940,7 @@ function renderSalesTableGeneric(tbodyId, salesObj, filterId, isYJ) {
                 <td class="py-3">${totaleCell}</td>
                 <td class="py-3 text-indigo-400 font-semibold">${spettCell}</td>
                 <td class="py-3 text-right">
-                    ${userRole === 'gestore' ? `<button onclick="window.deleteSaleItem('${sale.key}', ${isYJ})" class="p-1 bg-red-600/20 text-red-400 rounded hover:bg-red-600 hover:text-white transition" title="Annulla (storno)">
+                    ${userRole === 'gestore' ? `<button onclick="window.deleteSaleItem('${sale.key}', ${isYJ})" class="p-1 bg-red-600/20 text-red-400 rounded hover:bg-red-600 hover:text-white transition" title="Elimina vendita">
                         <i class="fa-solid fa-trash text-[10px]"></i>
                     </button>` : ''}
                 </td>
@@ -1982,7 +1959,7 @@ function renderSalesFenTable() {
 
 window.deleteSaleItem = function(key, isYJ) {
     if (userRole !== 'gestore') {
-        showToast('Solo il gestore può annullare una vendita (storno).', 'error');
+        showToast('Solo il gestore può annullare una vendita.', 'error');
         return;
     }
     const sales = isYJ ? localSalesYJ : localSalesFen;
@@ -1990,24 +1967,10 @@ window.deleteSaleItem = function(key, isYJ) {
     const sale = sales[key];
     if (!sale) return;
     if (sale._deleting) return;
-    showConfirmModal("Elimina Vendita", `Eliminare la vendita di "${sale.serviceName}" di ${sale.employeeName}? Verrà registrato uno STORNO sul saldo.`, () => {
-        const yellowGain = sale.yellowGain || 0;
+    showConfirmModal("Elimina Vendita", `Eliminare la vendita di "${sale.serviceName}" di ${sale.employeeName}? Il saldo cassa non verrà modificato.`, () => {
         sale._deleting = true;
-        const operatorName = (currentUser && currentUser.email) ? currentUser.email : 'Gestore';
         db.collection(collection).doc(key).delete()
-            .then(() => {
-                if (yellowGain <= 0) {
-                    showToast("Vendita rimossa.", "info");
-                    return;
-                }
-                return applyBalanceDelta(-yellowGain, {
-                    operatorName,
-                    employeeId: sale.employeeKey || null,
-                    type: 'storno',
-                    note: 'Annullamento vendita: ' + (sale.serviceName || '—'),
-                    saleId: key
-                }).then(() => showToast("Vendita rimossa. Storno cassa: " + formatValuta(yellowGain), "info"));
-            })
+            .then(() => showToast("Vendita rimossa.", "info"))
             .catch(err => showToast(err.message, "error"))
             .finally(() => { try { delete sale._deleting; } catch (_) {} });
     }, true);
